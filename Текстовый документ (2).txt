@@ -1,0 +1,1255 @@
+-- Target Hunt V6 - Server Script
+-- CHANGES from V5:
+--   • DataStore saves/loads player stats (Coins, XP, Level, TargetWins, Catches, Collects, BestSurvival)
+--   • DataStore saves/loads player inventory (owned items + equipped items)
+--   • New LeaderboardUpdate RemoteEvent fires top-10 stats every 10 seconds
+--   • Auto-save every 60 seconds per player
+-- Place in ServerScriptService
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService  = game:GetService("DataStoreService")
+local Workspace         = game:GetService("Workspace")
+
+print("[TargetHunt] V6 server script started.")
+
+-- ──────────────────────────────────────────
+-- DATA STORES
+-- ──────────────────────────────────────────
+local statsStore    = DataStoreService:GetDataStore("TargetHunt_Stats_V1")
+local inventoryStore = DataStoreService:GetDataStore("TargetHunt_Inventory_V1")
+
+-- ──────────────────────────────────────────
+-- CONFIG
+-- ──────────────────────────────────────────
+local CONFIG = {
+	MIN_PLAYERS            = 2,
+	INTERMISSION_TIME      = 30,
+	ANNOUNCE_TIME          = 5,
+	HUNT_TIME              = 30,
+	POST_ROUND_TIME        = 5,
+	CATCH_GRACE_SECONDS    = 2,
+
+	NORMAL_SPEED           = 16,
+	TARGET_SPEED           = 22,
+	NORMAL_JUMP_POWER      = 50,
+	TARGET_JUMP_POWER      = 60,
+
+	TARGET_COINS_PER_SECOND = 1,
+	TARGET_SURVIVE_BONUS   = 30,
+	KILLER_COINS_BONUS     = 45,
+	KILLER_XP_BONUS        = 25,
+	BOUNTY_BASE            = 25,
+	BOUNTY_PER_SECOND      = 1,
+
+	LEVEL_BASE_XP          = 100,
+	LEVEL_XP_GROWTH        = 50,
+	LEVEL_UP_COINS         = 25,
+
+	TARGET_ABILITY_DURATION   = 3,
+	TARGET_ABILITY_COOLDOWN   = 12,
+	TARGET_ABILITY_SPEED      = 28,
+	TARGET_ABILITY_TRANSPARENCY = 0.75,
+
+	HUNTER_BOOST_DURATION  = 2.5,
+	HUNTER_BOOST_COOLDOWN  = 10,
+	HUNTER_BOOST_SPEED     = 23,
+
+	COIN_VALUE             = 3,
+	MAX_COINS              = 18,
+	COIN_RESPAWN_TIME      = 5,
+	FALLBACK_COIN_RADIUS   = 45,
+
+	QUEST_COLLECT_GOAL     = 10,
+	QUEST_CATCH_GOAL       = 1,
+	QUEST_SURVIVE_GOAL     = 1,
+	QUEST_REWARD_COINS     = 50,
+	QUEST_REWARD_XP        = 25,
+
+	LOBBY_CENTER           = Vector3.new(0, 8, 170),
+	ARENA_FALLBACK_CENTER  = Vector3.new(0, 6, 0),
+	ARENA_FALLBACK_RADIUS  = 24,
+
+	EMOTE_COOLDOWN         = 2,
+	AUTO_SAVE_INTERVAL     = 60,
+	LEADERBOARD_UPDATE_INTERVAL = 10,
+}
+
+-- ──────────────────────────────────────────
+-- SHOP ITEMS (unchanged from V5)
+-- ──────────────────────────────────────────
+local SHOP_ITEMS = {
+	{ id="aura_red",      category="Aura",        name="Red Target Aura",   description="Default target glow.",          cost=0,   color=Color3.fromRGB(255,45,45)    },
+	{ id="aura_blue",     category="Aura",        name="Blue Target Aura",  description="Cold blue target glow.",        cost=75,  color=Color3.fromRGB(65,170,255)   },
+	{ id="aura_gold",     category="Aura",        name="Gold Target Aura",  description="Bright gold target glow.",      cost=150, color=Color3.fromRGB(255,205,58)   },
+	{ id="aura_purple",   category="Aura",        name="Void Target Aura",  description="Deep purple glow.",             cost=220, color=Color3.fromRGB(165,70,255)   },
+	{ id="trail_none",    category="Trail",       name="No Trail",          description="Clean movement.",               cost=0,   color=Color3.fromRGB(255,255,255)  },
+	{ id="trail_neon",    category="Trail",       name="Neon Trail",        description="Blue trail.",                   cost=120, color=Color3.fromRGB(80,220,255)   },
+	{ id="trail_gold",    category="Trail",       name="Gold Trail",        description="Golden trail.",                 cost=180, color=Color3.fromRGB(255,210,70)   },
+	{ id="trail_fire",    category="Trail",       name="Ember Trail",       description="Warm ember-colored trail.",     cost=240, color=Color3.fromRGB(255,110,50)   },
+	{ id="kill_basic",    category="Kill Effect", name="Standard Burst",    description="Default catch effect.",         cost=0,   color=Color3.fromRGB(255,200,60)   },
+	{ id="kill_confetti", category="Kill Effect", name="Confetti Burst",    description="Extra colorful confetti.",      cost=160, color=Color3.fromRGB(255,110,180)  },
+	{ id="kill_shockwave",category="Kill Effect", name="Shockwave",         description="A shockwave ring on catch.",    cost=200, color=Color3.fromRGB(120,200,255)  },
+	{ id="emote_wave",    category="Emote",       name="Wave",              description="A friendly wave.",              cost=0,   color=Color3.fromRGB(120,200,255)  },
+	{ id="emote_laugh",   category="Emote",       name="Laugh",             description="Laugh it off.",                 cost=50,  color=Color3.fromRGB(255,210,80)   },
+	{ id="emote_taunt",   category="Emote",       name="Taunt",             description="Taunt your hunters.",           cost=90,  color=Color3.fromRGB(255,80,80)    },
+	{ id="emote_dance",   category="Emote",       name="Dance",             description="Celebrate in style.",           cost=130, color=Color3.fromRGB(170,110,255)  },
+}
+
+-- ──────────────────────────────────────────
+-- REMOTES
+-- ──────────────────────────────────────────
+local remotesFolder = ReplicatedStorage:FindFirstChild("TargetHuntRemotes")
+if not remotesFolder then
+	remotesFolder = Instance.new("Folder")
+	remotesFolder.Name = "TargetHuntRemotes"
+	remotesFolder.Parent = ReplicatedStorage
+end
+
+local function getRemote(name)
+	local r = remotesFolder:FindFirstChild(name)
+	if not r then
+		r = Instance.new("RemoteEvent")
+		r.Name = name
+		r.Parent = remotesFolder
+	end
+	return r
+end
+
+local SetTarget          = getRemote("SetTarget")
+local ClearTarget        = getRemote("ClearTarget")
+local RoundTimerUpdate   = getRemote("RoundTimerUpdate")
+local RoundAnnouncement  = getRemote("RoundAnnouncement")
+local TargetCaught       = getRemote("TargetCaught")
+local RequestTargetAbility = getRemote("RequestTargetAbility")
+local AbilityCooldownUpdate = getRemote("AbilityCooldownUpdate")
+local TargetAbilityEffect = getRemote("TargetAbilityEffect")
+local CoinCollected      = getRemote("CoinCollected")
+local RoundStatsUpdate   = getRemote("RoundStatsUpdate")
+local RequestHunterBoost = getRemote("RequestHunterBoost")
+local HunterBoostUpdate  = getRemote("HunterBoostUpdate")
+local QuestUpdate        = getRemote("QuestUpdate")
+local ProgressToast      = getRemote("ProgressToast")
+local BountyUpdate       = getRemote("BountyUpdate")
+local RequestJoinMatch   = getRemote("RequestJoinMatch")
+local RequestLeaveMatch  = getRemote("RequestLeaveMatch")
+local MatchStateUpdate   = getRemote("MatchStateUpdate")
+local OpenShop           = getRemote("OpenShop")
+local OpenQuests         = getRemote("OpenQuests")
+local RequestShopData    = getRemote("RequestShopData")
+local RequestPurchase    = getRemote("RequestPurchase")
+local RequestEquipItem   = getRemote("RequestEquipItem")
+local ShopUpdate         = getRemote("ShopUpdate")
+local KillEffectTrigger  = getRemote("KillEffectTrigger")
+local RequestEmote       = getRemote("RequestEmote")
+local PlayEmote          = getRemote("PlayEmote")
+-- NEW V6
+local LeaderboardUpdate  = getRemote("LeaderboardUpdate")
+
+-- ──────────────────────────────────────────
+-- ROUND STATE
+-- ──────────────────────────────────────────
+local currentTarget    = nil
+local roundActive      = false
+local targetCaught     = false
+local roundId          = 0
+local catchEnabledAt   = 0
+local lastTargetUserId = nil
+local currentPhase     = "Lobby"
+
+local touchConnections     = {}
+local characterConnections = {}
+local deathConnection      = nil
+
+local lastTargetAbilityUse = {}
+local lastHunterBoostUse   = {}
+local lastEmoteUse         = {}
+local originalTransparency = {}
+local questProgress        = {}
+local playerInventory      = {}
+local currentBounty        = CONFIG.BOUNTY_BASE
+
+local coinsEnabled  = false
+local activeCoins   = {}
+local coinConnections = {}
+local lobbySpawn    = nil
+
+-- ──────────────────────────────────────────
+-- DATA STORE: DEFAULT DATA
+-- ──────────────────────────────────────────
+local DEFAULT_STATS = {
+	Level        = 1,
+	Coins        = 0,
+	XP           = 0,
+	TargetWins   = 0,
+	Catches      = 0,
+	Collects     = 0,
+	BestSurvival = 0,
+}
+
+local DEFAULT_INVENTORY = {
+	owned = {
+		aura_red   = true,
+		trail_none = true,
+		kill_basic = true,
+		emote_wave = true,
+	},
+	equipped = {
+		Aura            = "aura_red",
+		Trail           = "trail_none",
+		["Kill Effect"] = "kill_basic",
+	},
+}
+
+-- ──────────────────────────────────────────
+-- DATA STORE: LOAD
+-- ──────────────────────────────────────────
+local function loadPlayerData(player)
+	local uid = tostring(player.UserId)
+
+	-- Load stats
+	local statsOk, statsData = pcall(function()
+		return statsStore:GetAsync(uid)
+	end)
+
+	local stats = {}
+	if statsOk and type(statsData) == "table" then
+		for k, v in pairs(DEFAULT_STATS) do
+			stats[k] = (type(statsData[k]) == type(v)) and statsData[k] or v
+		end
+	else
+		for k, v in pairs(DEFAULT_STATS) do
+			stats[k] = v
+		end
+	end
+
+	-- Load inventory
+	local invOk, invData = pcall(function()
+		return inventoryStore:GetAsync(uid)
+	end)
+
+	local inventory
+	if invOk and type(invData) == "table" then
+		inventory = {
+			owned    = (type(invData.owned) == "table")    and invData.owned    or DEFAULT_INVENTORY.owned,
+			equipped = (type(invData.equipped) == "table") and invData.equipped or DEFAULT_INVENTORY.equipped,
+		}
+		-- Always ensure free defaults are owned
+		for k, v in pairs(DEFAULT_INVENTORY.owned) do
+			if v then inventory.owned[k] = true end
+		end
+		-- Validate equipped slots exist in owned
+		for cat, id in pairs(DEFAULT_INVENTORY.equipped) do
+			if not inventory.equipped[cat] then
+				inventory.equipped[cat] = id
+			end
+		end
+	else
+		inventory = {
+			owned    = {},
+			equipped = {},
+		}
+		for k, v in pairs(DEFAULT_INVENTORY.owned) do inventory.owned[k] = v end
+		for k, v in pairs(DEFAULT_INVENTORY.equipped) do inventory.equipped[k] = v end
+	end
+
+	return stats, inventory
+end
+
+-- ──────────────────────────────────────────
+-- DATA STORE: SAVE
+-- ──────────────────────────────────────────
+local function savePlayerData(player)
+	local uid = tostring(player.UserId)
+
+	-- Save stats from leaderstats
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if leaderstats then
+		local statsData = {}
+		for k in pairs(DEFAULT_STATS) do
+			local val = leaderstats:FindFirstChild(k)
+			statsData[k] = val and val.Value or DEFAULT_STATS[k]
+		end
+		pcall(function()
+			statsStore:SetAsync(uid, statsData)
+		end)
+	end
+
+	-- Save inventory
+	local inv = playerInventory[player.UserId]
+	if inv then
+		pcall(function()
+			inventoryStore:SetAsync(uid, {
+				owned    = inv.owned,
+				equipped = inv.equipped,
+			})
+		end)
+	end
+end
+
+-- ──────────────────────────────────────────
+-- LEADERSTATS SETUP
+-- ──────────────────────────────────────────
+local function setupLeaderstats(player, stats)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if not leaderstats then
+		leaderstats = Instance.new("Folder")
+		leaderstats.Name = "leaderstats"
+		leaderstats.Parent = player
+	end
+
+	for name, default in pairs(DEFAULT_STATS) do
+		local existing = leaderstats:FindFirstChild(name)
+		if existing then
+			existing.Value = stats[name] or default
+		else
+			local value = Instance.new("IntValue")
+			value.Name  = name
+			value.Value = stats[name] or default
+			value.Parent = leaderstats
+		end
+	end
+end
+
+-- ──────────────────────────────────────────
+-- LEADERBOARD BROADCAST
+-- ──────────────────────────────────────────
+local function buildLeaderboard()
+	local entries = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		local leaderstats = player:FindFirstChild("leaderstats")
+		if leaderstats then
+			local level  = leaderstats:FindFirstChild("Level")
+			local coins  = leaderstats:FindFirstChild("Coins")
+			local wins   = leaderstats:FindFirstChild("TargetWins")
+			local catches = leaderstats:FindFirstChild("Catches")
+			table.insert(entries, {
+				name     = player.Name,
+				userId   = player.UserId,
+				level    = level   and level.Value   or 1,
+				coins    = coins   and coins.Value   or 0,
+				wins     = wins    and wins.Value    or 0,
+				catches  = catches and catches.Value or 0,
+			})
+		end
+	end
+	-- Sort by wins desc, then coins desc
+	table.sort(entries, function(a, b)
+		if a.wins ~= b.wins then return a.wins > b.wins end
+		return a.coins > b.coins
+	end)
+	-- Trim to top 10
+	local top = {}
+	for i = 1, math.min(10, #entries) do
+		top[i] = entries[i]
+	end
+	return top
+end
+
+local function broadcastLeaderboard()
+	local data = buildLeaderboard()
+	for _, player in ipairs(Players:GetPlayers()) do
+		LeaderboardUpdate:FireClient(player, data)
+	end
+end
+
+-- ──────────────────────────────────────────
+-- HELPERS (same as V5, kept compact)
+-- ──────────────────────────────────────────
+local function canUseLobbyTransition()
+	return currentPhase == "Lobby" or currentPhase == "Calm"
+end
+
+local function getLeaderValue(player, name)
+	local ls = player:FindFirstChild("leaderstats")
+	return ls and ls:FindFirstChild(name)
+end
+
+local function addLeaderValue(player, name, amount)
+	local v = getLeaderValue(player, name)
+	if v then v.Value += amount end
+end
+
+local function getXpNeeded(level)
+	return CONFIG.LEVEL_BASE_XP + ((level - 1) * CONFIG.LEVEL_XP_GROWTH)
+end
+
+local function sendToast(player, title, message, kind)
+	ProgressToast:FireClient(player, title, message, kind or "info")
+end
+
+local function awardCoins(player, amount, reason)
+	addLeaderValue(player, "Coins", amount)
+	if reason then sendToast(player, "+"..amount.." Coins", reason, "coins") end
+end
+
+local function awardXP(player, amount, reason)
+	addLeaderValue(player, "XP", amount)
+	local level = getLeaderValue(player, "Level")
+	local xp    = getLeaderValue(player, "XP")
+	if not level or not xp then return end
+	while xp.Value >= getXpNeeded(level.Value) do
+		xp.Value -= getXpNeeded(level.Value)
+		level.Value += 1
+		addLeaderValue(player, "Coins", CONFIG.LEVEL_UP_COINS)
+		sendToast(player, "LEVEL "..level.Value, "+"..CONFIG.LEVEL_UP_COINS.." Coins", "level")
+	end
+	if reason then sendToast(player, "+"..amount.." XP", reason, "xp") end
+end
+
+local function setLeaderMax(player, name, amount)
+	local v = getLeaderValue(player, name)
+	if v and amount > v.Value then v.Value = amount end
+end
+
+local function getShopItem(itemId)
+	for _, item in ipairs(SHOP_ITEMS) do
+		if item.id == itemId then return item end
+	end
+	return nil
+end
+
+local function getInventory(player)
+	local inv = playerInventory[player.UserId]
+	if not inv then
+		inv = {
+			owned    = { aura_red=true, trail_none=true, kill_basic=true, emote_wave=true },
+			equipped = { Aura="aura_red", Trail="trail_none", ["Kill Effect"]="kill_basic" },
+		}
+		playerInventory[player.UserId] = inv
+	end
+	return inv
+end
+
+local function isInMatch(player)
+	return player:GetAttribute("InMatch") == true
+end
+
+local function getHumanoid(player)
+	local c = player.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getMatchPlayers()
+	local result = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		local h = getHumanoid(player)
+		if isInMatch(player) and h and h.Health > 0 then
+			table.insert(result, player)
+		end
+	end
+	return result
+end
+
+local function getJoinedPlayers()
+	local result = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if isInMatch(player) then table.insert(result, player) end
+	end
+	return result
+end
+
+local function fireToMatch(remote, ...)
+	for _, player in ipairs(getJoinedPlayers()) do
+		remote:FireClient(player, ...)
+	end
+end
+
+local function sendMatchState(player)
+	MatchStateUpdate:FireClient(player, {
+		inMatch     = isInMatch(player),
+		roundActive = roundActive,
+		phase       = currentPhase,
+		canJoin     = (not isInMatch(player)) and canUseLobbyTransition(),
+		canLeave    = isInMatch(player) and canUseLobbyTransition(),
+		targetName  = currentTarget and currentTarget.Name or "",
+		targetUserId = currentTarget and currentTarget.UserId or 0,
+	})
+end
+
+local function sendMatchStateToAll()
+	for _, player in ipairs(Players:GetPlayers()) do sendMatchState(player) end
+end
+
+local function getQuestState(player)
+	local state = questProgress[player.UserId]
+	if not state then
+		state = {
+			collect=0, catch=0, survive=0,
+			completed={ collect=false, catch=false, survive=false },
+		}
+		questProgress[player.UserId] = state
+	end
+	return state
+end
+
+local function sendQuestUpdate(player)
+	local state = getQuestState(player)
+	QuestUpdate:FireClient(player, {
+		collect=state.collect, collectGoal=CONFIG.QUEST_COLLECT_GOAL, collectDone=state.completed.collect,
+		catch=state.catch,     catchGoal=CONFIG.QUEST_CATCH_GOAL,     catchDone=state.completed.catch,
+		survive=state.survive, surviveGoal=CONFIG.QUEST_SURVIVE_GOAL, surviveDone=state.completed.survive,
+		rewardCoins=CONFIG.QUEST_REWARD_COINS, rewardXP=CONFIG.QUEST_REWARD_XP,
+		quests={
+			{ key="collect", title="Coin Runner",     body="Collect coins",        current=state.collect, goal=CONFIG.QUEST_COLLECT_GOAL, done=state.completed.collect },
+			{ key="catch",   title="Target Catcher",  body="Catch the target",     current=state.catch,   goal=CONFIG.QUEST_CATCH_GOAL,   done=state.completed.catch   },
+			{ key="survive", title="Survivor",         body="Survive once as target", current=state.survive, goal=CONFIG.QUEST_SURVIVE_GOAL, done=state.completed.survive },
+		},
+	})
+end
+
+local function completeQuest(player, key, title)
+	local state = getQuestState(player)
+	if state.completed[key] then return end
+	state.completed[key] = true
+	awardCoins(player, CONFIG.QUEST_REWARD_COINS)
+	awardXP(player, CONFIG.QUEST_REWARD_XP)
+	sendToast(player, "Quest complete", title.." +"..CONFIG.QUEST_REWARD_COINS.." Coins", "quest")
+	sendQuestUpdate(player)
+end
+
+local function addQuestProgress(player, key, amount)
+	local state = getQuestState(player)
+	if state.completed[key] then return end
+	state[key] += amount
+	if key=="collect" and state.collect >= CONFIG.QUEST_COLLECT_GOAL then
+		completeQuest(player, key, "Coin runner")
+	elseif key=="catch" and state.catch >= CONFIG.QUEST_CATCH_GOAL then
+		completeQuest(player, key, "Target catcher")
+	elseif key=="survive" and state.survive >= CONFIG.QUEST_SURVIVE_GOAL then
+		completeQuest(player, key, "Survivor")
+	else
+		sendQuestUpdate(player)
+	end
+end
+
+local function setMovement(player, speed, jumpPower)
+	local h = getHumanoid(player)
+	if not h then return end
+	h.WalkSpeed = speed
+	if h.UseJumpPower then h.JumpPower = jumpPower
+	else h.JumpHeight = jumpPower / 7 end
+end
+
+local function resetPlayerMovement(player) setMovement(player, CONFIG.NORMAL_SPEED, CONFIG.NORMAL_JUMP_POWER) end
+local function resetAllMovement() for _, p in ipairs(Players:GetPlayers()) do resetPlayerMovement(p) end end
+
+local function clearTouchConnections()
+	for _, c in ipairs(touchConnections) do c:Disconnect() end
+	touchConnections = {}
+	if deathConnection then deathConnection:Disconnect(); deathConnection = nil end
+end
+
+local function clearCharacterConnections()
+	for _, c in ipairs(characterConnections) do c:Disconnect() end
+	characterConnections = {}
+end
+
+local function playerFromTouchedPart(part)
+	local model = part:FindFirstAncestorOfClass("Model")
+	return model and Players:GetPlayerFromCharacter(model)
+end
+
+local function restoreTransparency(player)
+	local saved = originalTransparency[player]
+	if not saved then return end
+	for inst, t in pairs(saved) do
+		if inst and inst.Parent then inst.Transparency = t end
+	end
+	originalTransparency[player] = nil
+end
+
+local function fadeCharacter(player, transparency)
+	local character = player.Character
+	if not character then return end
+	restoreTransparency(player)
+	originalTransparency[player] = {}
+	for _, inst in ipairs(character:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Name ~= "HumanoidRootPart" then
+			originalTransparency[player][inst] = inst.Transparency
+			inst.Transparency = math.max(inst.Transparency, transparency)
+		elseif inst:IsA("Decal") then
+			originalTransparency[player][inst] = inst.Transparency
+			inst.Transparency = math.max(inst.Transparency, transparency)
+		end
+	end
+end
+
+-- ──────────────────────────────────────────
+-- MAP GENERATION (same as V5)
+-- ──────────────────────────────────────────
+local function makePart(parent, name, size, cframe, color, material)
+	local part = Instance.new("Part")
+	part.Name=name; part.Size=size; part.CFrame=cframe; part.Anchored=true
+	part.Color=color; part.Material=material or Enum.Material.SmoothPlastic
+	part.TopSurface=Enum.SurfaceType.Smooth; part.BottomSurface=Enum.SurfaceType.Smooth
+	part.Parent=parent
+	return part
+end
+
+local function ensureStarterMap()
+	if Workspace:FindFirstChild("TargetHuntMap") then return end
+	local map = Instance.new("Folder"); map.Name="TargetHuntMap"; map.Parent=Workspace
+	makePart(map,"ArenaGround",   Vector3.new(100,1,100),  CFrame.new(0,0,0),    Color3.fromRGB(86,103,91),  Enum.Material.Grass)
+	makePart(map,"CentralSquare", Vector3.new(46,0.2,46),  CFrame.new(0,0.62,0), Color3.fromRGB(77,80,86),   Enum.Material.Concrete)
+	local spawns = Instance.new("Folder"); spawns.Name="PlayerSpawns"; spawns.Parent=map
+	local spawnPos = { Vector3.new(-28,2,-28), Vector3.new(28,2,-28), Vector3.new(-28,2,28),
+		Vector3.new(28,2,28),   Vector3.new(0,2,-34),  Vector3.new(0,2,34) }
+	for i, pos in ipairs(spawnPos) do
+		local sp = makePart(spawns,"ArenaSpawn"..i, Vector3.new(5,0.35,5), CFrame.new(pos), Color3.fromRGB(80,150,255), Enum.Material.Neon)
+		sp.Transparency=0.45; sp.CanCollide=false
+	end
+	local buildings = {
+		{ name="ShopBlock",   position=Vector3.new(-38,8,-5),  size=Vector3.new(18,16,24), color=Color3.fromRGB(127,134,146) },
+		{ name="OfficeBlock", position=Vector3.new(36,10,18),  size=Vector3.new(22,20,18), color=Color3.fromRGB(112,124,139) },
+		{ name="GarageBlock", position=Vector3.new(15,6,-38),  size=Vector3.new(26,12,16), color=Color3.fromRGB(137,121,107) },
+	}
+	for _, b in ipairs(buildings) do makePart(map,b.name,b.size,CFrame.new(b.position),b.color,Enum.Material.Brick) end
+	local covers = { Vector3.new(-12,2.2,-4), Vector3.new(12,2.2,7), Vector3.new(-4,2.2,18), Vector3.new(22,2.2,-14), Vector3.new(-24,2.2,16) }
+	for i, pos in ipairs(covers) do makePart(map,"CoverBox"..i, Vector3.new(7,4,5), CFrame.new(pos), Color3.fromRGB(116,87,58), Enum.Material.WoodPlanks) end
+	local coinSpawns = Instance.new("Folder"); coinSpawns.Name="CoinSpawns"; coinSpawns.Parent=map
+	for i = 1,18 do
+		local a = (math.pi*2/18)*i; local r = 18+(i%3)*8
+		local sp = makePart(coinSpawns,"CoinSpawn"..i, Vector3.new(1,1,1), CFrame.new(Vector3.new(math.cos(a)*r,2.2,math.sin(a)*r)), Color3.fromRGB(255,215,65), Enum.Material.Neon)
+		sp.Transparency=1; sp.CanCollide=false
+	end
+end
+
+ensureStarterMap()
+
+-- ──────────────────────────────────────────
+-- LOBBY OBJECT DETECTION (same as V5)
+-- ──────────────────────────────────────────
+local function getFirstBasePart(inst)
+	if not inst then return nil end
+	if inst:IsA("BasePart") then return inst end
+	if inst:IsA("Model") and inst.PrimaryPart then return inst.PrimaryPart end
+	for _, d in ipairs(inst:GetDescendants()) do if d:IsA("BasePart") then return d end end
+	return nil
+end
+
+local function textMatches(text, terms)
+	local lower = string.lower(text)
+	for _, term in ipairs(terms) do
+		if string.find(lower, string.lower(term), 1, true) then return true end
+	end
+	return false
+end
+
+local function findNamedPart(roots, terms)
+	for _, root in ipairs(roots) do
+		if root then
+			if textMatches(root.Name, terms) then
+				local p = getFirstBasePart(root); if p then return p end
+			end
+			for _, d in ipairs(root:GetDescendants()) do
+				if textMatches(d.Name, terms) then
+					local p = getFirstBasePart(d); if p then return p end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function findLobbyObjects()
+	local lobbyRoot = Workspace:FindFirstChild("Floating Lobby") or Workspace:FindFirstChild("Lobby") or Workspace
+	local roots = { lobbyRoot }
+	local spawn = Workspace:FindFirstChild("LobbySpawn", true) or Workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+	local playPart      = findNamedPart(roots, { "play","portal","start","join" })
+	local cosmeticsPart = findNamedPart(roots, { "cosmetics","cosmetic","aura","trail" })
+	local questsPart    = findNamedPart(roots, { "quests","quest","daily" })
+	return spawn, playPart, cosmeticsPart, questsPart
+end
+
+local playPortal, shopStand, questBoard
+lobbySpawn, playPortal, shopStand, questBoard = findLobbyObjects()
+
+-- ──────────────────────────────────────────
+-- TELEPORT HELPERS
+-- ──────────────────────────────────────────
+local function getArenaSpawnCFrame()
+	local map = Workspace:FindFirstChild("TargetHuntMap")
+	local spawnsFolder = map and (map:FindFirstChild("PlayerSpawns") or map:FindFirstChild("ArenaSpawns"))
+	local spawns = {}
+	if spawnsFolder then
+		for _, sp in ipairs(spawnsFolder:GetChildren()) do
+			if sp:IsA("BasePart") then table.insert(spawns, sp) end
+		end
+	end
+	if #spawns > 0 then
+		return spawns[math.random(1,#spawns)].CFrame + Vector3.new(0,4,0)
+	end
+	local offset = Vector3.new(math.random(-CONFIG.ARENA_FALLBACK_RADIUS, CONFIG.ARENA_FALLBACK_RADIUS), 0, math.random(-CONFIG.ARENA_FALLBACK_RADIUS, CONFIG.ARENA_FALLBACK_RADIUS))
+	return CFrame.new(CONFIG.ARENA_FALLBACK_CENTER + offset)
+end
+
+local function teleportCharacter(player, cframe)
+	local c = player.Character
+	if not c then return end
+	local root = c:FindFirstChild("HumanoidRootPart") or c:WaitForChild("HumanoidRootPart", 3)
+	if not root then return end
+	c:PivotTo(cframe)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function teleportToLobby(player)
+	local spawnCFrame = lobbySpawn and lobbySpawn.CFrame + Vector3.new(0,4,0) or CFrame.new(CONFIG.LOBBY_CENTER + Vector3.new(0,5,18))
+	teleportCharacter(player, spawnCFrame)
+end
+
+local function teleportToArena(player)
+	teleportCharacter(player, getArenaSpawnCFrame())
+end
+
+-- ──────────────────────────────────────────
+-- COSMETICS (same as V5)
+-- ──────────────────────────────────────────
+local function clearCosmetics(player)
+	local c = player.Character
+	if not c then return end
+	local folder = c:FindFirstChild("TargetHuntCosmetics")
+	if folder then folder:Destroy() end
+	local root = c:FindFirstChild("HumanoidRootPart")
+	if root then
+		for _, name in ipairs({"TrailAttachment0","TrailAttachment1","CosmeticTrail","TargetAuraLight","TargetAuraSparkles"}) do
+			local inst = root:FindFirstChild(name); if inst then inst:Destroy() end
+		end
+	end
+end
+
+local function applyCosmetics(player)
+	local c = player.Character
+	if not c then return end
+	local root = c:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	clearCosmetics(player)
+	local inventory = getInventory(player)
+
+	local trailItem = getShopItem(inventory.equipped.Trail)
+	if trailItem and trailItem.id ~= "trail_none" then
+		local a0 = Instance.new("Attachment"); a0.Name="TrailAttachment0"; a0.Position=Vector3.new(-0.45,-1.1,0); a0.Parent=root
+		local a1 = Instance.new("Attachment"); a1.Name="TrailAttachment1"; a1.Position=Vector3.new(0.45,-1.1,0);  a1.Parent=root
+		local trail = Instance.new("Trail"); trail.Name="CosmeticTrail"
+		trail.Attachment0=a0; trail.Attachment1=a1; trail.Color=ColorSequence.new(trailItem.color)
+		trail.Lifetime=0.35; trail.LightEmission=0.8; trail.MinLength=0.08
+		trail.WidthScale=NumberSequence.new({NumberSequenceKeypoint.new(0,0.85),NumberSequenceKeypoint.new(1,0)})
+		trail.Parent=root
+	end
+
+	if player == currentTarget and roundActive then
+		local auraItem = getShopItem(inventory.equipped.Aura) or getShopItem("aura_red")
+		local light = Instance.new("PointLight"); light.Name="TargetAuraLight"
+		light.Color=auraItem.color; light.Range=13; light.Brightness=2; light.Parent=root
+		local sparkles = Instance.new("Sparkles"); sparkles.Name="TargetAuraSparkles"
+		sparkles.SparkleColor=auraItem.color; sparkles.Parent=root
+	end
+end
+
+local function applyCosmeticsToAll()
+	for _, p in ipairs(Players:GetPlayers()) do applyCosmetics(p) end
+end
+
+-- ──────────────────────────────────────────
+-- SHOP PAYLOAD
+-- ──────────────────────────────────────────
+local function sendShopUpdate(player)
+	local inventory = getInventory(player)
+	local coins = getLeaderValue(player, "Coins")
+	local items = {}
+	for _, item in ipairs(SHOP_ITEMS) do
+		table.insert(items, {
+			id=item.id, category=item.category, name=item.name,
+			description=item.description, cost=item.cost, color=item.color,
+			owned=inventory.owned[item.id]==true,
+			equipped=inventory.equipped[item.category]==item.id,
+		})
+	end
+	ShopUpdate:FireClient(player, {
+		coins=coins and coins.Value or 0,
+		items=items,
+		equipped=inventory.equipped,
+	})
+end
+
+-- ──────────────────────────────────────────
+-- COINS
+-- ──────────────────────────────────────────
+local function getCoinsFolder()
+	local f = Workspace:FindFirstChild("TargetHuntCoins")
+	if not f then f = Instance.new("Folder"); f.Name="TargetHuntCoins"; f.Parent=Workspace end
+	return f
+end
+
+local function disconnectCoin(part)
+	local c = coinConnections[part]; if c then c:Disconnect(); coinConnections[part]=nil end
+	activeCoins[part] = nil
+end
+
+local function clearCoins()
+	for part in pairs(activeCoins) do
+		disconnectCoin(part)
+		if part and part.Parent then part:Destroy() end
+	end
+	activeCoins={}; coinConnections={}
+end
+
+local function getCoinSpawnPositions()
+	local map = Workspace:FindFirstChild("TargetHuntMap")
+	local spawnsFolder = map and map:FindFirstChild("CoinSpawns")
+	local positions = {}
+	if spawnsFolder then
+		for _, sp in ipairs(spawnsFolder:GetChildren()) do
+			if sp:IsA("BasePart") then table.insert(positions, sp.Position + Vector3.new(0,2.2,0)) end
+		end
+	end
+	if #positions == 0 then
+		for _ = 1, CONFIG.MAX_COINS do
+			table.insert(positions, Vector3.new(math.random(-CONFIG.FALLBACK_COIN_RADIUS,CONFIG.FALLBACK_COIN_RADIUS),4,math.random(-CONFIG.FALLBACK_COIN_RADIUS,CONFIG.FALLBACK_COIN_RADIUS)))
+		end
+	end
+	return positions
+end
+
+local function countActiveCoins()
+	local count = 0
+	for part in pairs(activeCoins) do if part and part.Parent then count+=1 end end
+	return count
+end
+
+local spawnCoin
+local function ensureCoinCount()
+	if not coinsEnabled then return end
+	while countActiveCoins() < CONFIG.MAX_COINS do spawnCoin() end
+end
+
+spawnCoin = function()
+	if not coinsEnabled then return end
+	local positions = getCoinSpawnPositions()
+	if #positions == 0 then return end
+	local position = positions[math.random(1,#positions)]
+	local coin = Instance.new("Part")
+	coin.Name="TargetHuntCoin"; coin.Shape=Enum.PartType.Ball; coin.Size=Vector3.new(1.1,1.1,1.1)
+	coin.Position=position; coin.Anchored=true; coin.CanCollide=false
+	coin.Material=Enum.Material.Neon; coin.Color=Color3.fromRGB(255,205,54); coin.Parent=getCoinsFolder()
+	local light = Instance.new("PointLight"); light.Brightness=1.4; light.Range=7; light.Color=coin.Color; light.Parent=coin
+	activeCoins[coin] = true
+	coinConnections[coin] = coin.Touched:Connect(function(hit)
+		local player = playerFromTouchedPart(hit)
+		if not player or not activeCoins[coin] or not isInMatch(player) then return end
+		disconnectCoin(coin)
+		awardCoins(player, CONFIG.COIN_VALUE)
+		addLeaderValue(player, "Collects", 1)
+		addQuestProgress(player, "collect", 1)
+		CoinCollected:FireClient(player, CONFIG.COIN_VALUE)
+		sendShopUpdate(player)
+		coin:Destroy()
+		task.delay(CONFIG.COIN_RESPAWN_TIME, ensureCoinCount)
+	end)
+end
+
+-- ──────────────────────────────────────────
+-- ROUND LOGIC
+-- ──────────────────────────────────────────
+local function sendTimer(phase, secondsLeft)
+	currentPhase = phase
+	RoundTimerUpdate:FireAllClients(phase, secondsLeft)
+end
+
+local function sendStats(eventName, extra)
+	local payload = {
+		event=eventName, targetName=currentTarget and currentTarget.Name or "",
+		targetUserId=currentTarget and currentTarget.UserId or 0, roundActive=roundActive,
+	}
+	if extra then for k,v in pairs(extra) do payload[k]=v end end
+	fireToMatch(RoundStatsUpdate, payload)
+end
+
+local function finishHunt(result, hunter)
+	if not roundActive then return end
+	roundActive = false
+	targetCaught = result == "caught"
+
+	if currentTarget then
+		restoreTransparency(currentTarget)
+		resetPlayerMovement(currentTarget)
+	end
+
+	if result == "caught" then
+		if hunter and hunter ~= currentTarget then
+			local totalCatchCoins = CONFIG.KILLER_COINS_BONUS + currentBounty
+			awardCoins(hunter, totalCatchCoins, "Target caught")
+			awardXP(hunter, CONFIG.KILLER_XP_BONUS, "Target caught")
+			addLeaderValue(hunter, "Catches", 1)
+			addQuestProgress(hunter, "catch", 1)
+			sendShopUpdate(hunter)
+			fireToMatch(TargetCaught, hunter, currentTarget)
+			fireToMatch(RoundAnnouncement, hunter.Name.." caught "..currentTarget.Name.."!", "caught", CONFIG.POST_ROUND_TIME)
+			sendStats("caught", { hunterName=hunter.Name, rewardCoins=totalCatchCoins, rewardXP=CONFIG.KILLER_XP_BONUS, bounty=currentBounty })
+			local hunterInventory = getInventory(hunter)
+			local killEffectId = hunterInventory.equipped["Kill Effect"] or "kill_basic"
+			fireToMatch(KillEffectTrigger, killEffectId)
+		elseif currentTarget then
+			fireToMatch(TargetCaught, nil, currentTarget)
+			fireToMatch(RoundAnnouncement, currentTarget.Name.." was caught!", "caught", CONFIG.POST_ROUND_TIME)
+			sendStats("caught", { hunterName="" })
+			fireToMatch(KillEffectTrigger, "kill_basic")
+		end
+	elseif currentTarget then
+		awardCoins(currentTarget, CONFIG.TARGET_SURVIVE_BONUS + currentBounty, "Survived the hunt")
+		awardXP(currentTarget, CONFIG.KILLER_XP_BONUS, "Survived the hunt")
+		addLeaderValue(currentTarget, "TargetWins", 1)
+		setLeaderMax(currentTarget, "BestSurvival", CONFIG.HUNT_TIME)
+		addQuestProgress(currentTarget, "survive", 1)
+		sendShopUpdate(currentTarget)
+		fireToMatch(RoundAnnouncement, currentTarget.Name.." survived!", "survived", CONFIG.POST_ROUND_TIME)
+		sendStats("survived", { survivalTime=CONFIG.HUNT_TIME, rewardCoins=CONFIG.TARGET_SURVIVE_BONUS+currentBounty, rewardXP=CONFIG.KILLER_XP_BONUS, bounty=currentBounty })
+	end
+
+	ClearTarget:FireAllClients(result)
+	BountyUpdate:FireAllClients(0)
+	clearTouchConnections()
+	clearCharacterConnections()
+	resetAllMovement()
+	applyCosmeticsToAll()
+	sendMatchStateToAll()
+	broadcastLeaderboard()
+end
+
+local function attachTargetCatchDetection(target)
+	clearTouchConnections()
+	local character = target.Character
+	if not character then return end
+	for _, inst in ipairs(character:GetDescendants()) do
+		if inst:IsA("BasePart") then
+			local connection = inst.Touched:Connect(function(hit)
+				if not roundActive or currentTarget ~= target or targetCaught then return end
+				if os.clock() < catchEnabledAt then return end
+				local hunter = playerFromTouchedPart(hit)
+				if hunter and hunter ~= target and isInMatch(hunter) then
+					finishHunt("caught", hunter)
+				end
+			end)
+			table.insert(touchConnections, connection)
+		end
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		deathConnection = humanoid.Died:Connect(function()
+			if roundActive and currentTarget == target then finishHunt("caught", nil) end
+		end)
+	end
+end
+
+local function chooseTarget()
+	local players = getMatchPlayers()
+	if #players == 0 then return nil end
+	if #players == 1 then return players[1] end
+	local candidates = {}
+	for _, p in ipairs(players) do
+		if p.UserId ~= lastTargetUserId then table.insert(candidates, p) end
+	end
+	if #candidates == 0 then candidates = players end
+	return candidates[math.random(1, #candidates)]
+end
+
+local function countPlayers() return #getMatchPlayers() end
+
+local function waitWithTimer(phase, duration)
+	for secondsLeft = duration, 1, -1 do
+		sendTimer(phase, secondsLeft)
+		sendMatchStateToAll()
+		task.wait(1)
+	end
+	sendTimer(phase, 0)
+end
+
+local function runIntermission()
+	currentTarget=nil; roundActive=false; coinsEnabled=true
+	ensureCoinCount(); applyCosmeticsToAll()
+	for _, p in ipairs(Players:GetPlayers()) do sendQuestUpdate(p); sendShopUpdate(p) end
+	sendStats("intermission")
+	fireToMatch(RoundAnnouncement, "Collect coins and get ready.", "intermission", 3)
+	waitWithTimer("Calm", CONFIG.INTERMISSION_TIME)
+end
+
+local function runAnnouncement(target)
+	currentTarget=target; lastTargetUserId=target.UserId
+	sendStats("target-selected")
+	fireToMatch(RoundAnnouncement, target.Name.." IS THE TARGET!", "target-selected", CONFIG.ANNOUNCE_TIME)
+	fireToMatch(SetTarget, target)
+	waitWithTimer("Target selected", CONFIG.ANNOUNCE_TIME)
+end
+
+local function runHunt(target)
+	roundId+=1; local thisRound=roundId
+	currentTarget=target; targetCaught=false; roundActive=true
+	currentBounty=CONFIG.BOUNTY_BASE; catchEnabledAt=os.clock()+CONFIG.CATCH_GRACE_SECONDS
+
+	setMovement(target, CONFIG.TARGET_SPEED, CONFIG.TARGET_JUMP_POWER)
+	attachTargetCatchDetection(target)
+	ensureCoinCount(); sendStats("hunt-start")
+	BountyUpdate:FireAllClients(currentBounty)
+	applyCosmeticsToAll(); sendMatchStateToAll()
+
+	table.insert(characterConnections, target.CharacterAdded:Connect(function()
+		if currentTarget==target and roundActive and roundId==thisRound then
+			task.wait(0.25)
+			teleportToArena(target)
+			setMovement(target, CONFIG.TARGET_SPEED, CONFIG.TARGET_JUMP_POWER)
+			attachTargetCatchDetection(target)
+			applyCosmetics(target)
+		end
+	end))
+
+	for secondsLeft = CONFIG.HUNT_TIME, 1, -1 do
+		if not roundActive or currentTarget~=target or roundId~=thisRound then break end
+		sendTimer("Hunt", secondsLeft)
+		task.wait(1)
+		if roundActive and currentTarget==target and roundId==thisRound then
+			addLeaderValue(target, "Coins", CONFIG.TARGET_COINS_PER_SECOND)
+			sendShopUpdate(target)
+			setLeaderMax(target, "BestSurvival", CONFIG.HUNT_TIME-secondsLeft+1)
+			currentBounty = CONFIG.BOUNTY_BASE + ((CONFIG.HUNT_TIME-secondsLeft+1)*CONFIG.BOUNTY_PER_SECOND)
+			BountyUpdate:FireAllClients(currentBounty)
+		end
+	end
+
+	if roundActive and currentTarget==target and roundId==thisRound then
+		sendTimer("Hunt",0); finishHunt("survived",nil)
+	end
+
+	task.wait(CONFIG.POST_ROUND_TIME)
+	currentTarget=nil; applyCosmeticsToAll(); sendMatchStateToAll()
+end
+
+-- ──────────────────────────────────────────
+-- JOIN / LEAVE MATCH
+-- ──────────────────────────────────────────
+local function joinMatch(player)
+	if isInMatch(player) then sendMatchState(player); return end
+	if not canUseLobbyTransition() then
+		sendMatchState(player); sendToast(player, "Round in progress", "Join during the break.", "info"); return
+	end
+	player:SetAttribute("InMatch", true)
+	teleportToArena(player); resetPlayerMovement(player); applyCosmetics(player)
+	sendMatchState(player); sendToast(player, "Joined hunt", "You are now in the arena.", "info")
+	if currentTarget and roundActive then
+		SetTarget:FireClient(player, currentTarget)
+		if player ~= currentTarget then HunterBoostUpdate:FireClient(player, 0, true) end
+	end
+end
+
+local function leaveMatch(player)
+	if not isInMatch(player) then sendMatchState(player); return end
+	if not canUseLobbyTransition() then
+		sendMatchState(player); sendToast(player, "Round in progress", "Leave after the round.", "info"); return
+	end
+	if player==currentTarget and roundActive then finishHunt("caught",nil) end
+	player:SetAttribute("InMatch", false)
+	restoreTransparency(player); resetPlayerMovement(player); clearCosmetics(player)
+	teleportToLobby(player); sendMatchState(player)
+	ClearTarget:FireClient(player, "lobby")
+	sendToast(player, "Lobby", "Shop and quests are open here.", "info")
+end
+
+-- ──────────────────────────────────────────
+-- PROXIMITY PROMPTS
+-- ──────────────────────────────────────────
+local function attachPrompt(part, name, actionText, objectText, callback)
+	if not part or part:FindFirstChild(name) then return end
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name=name; prompt.ActionText=actionText; prompt.ObjectText=objectText
+	prompt.KeyboardKeyCode=Enum.KeyCode.F; prompt.HoldDuration=0
+	prompt.MaxActivationDistance=14; prompt.RequiresLineOfSight=false
+	prompt.Parent=part; prompt.Triggered:Connect(callback)
+end
+
+attachPrompt(playPortal, "PlayPrompt",  "Enter Hunt",   "Target Hunt", joinMatch)
+attachPrompt(shopStand,  "ShopPrompt",  "Open Shop",    "Cosmetics",   function(player)
+	sendShopUpdate(player); OpenShop:FireClient(player)
+end)
+attachPrompt(questBoard, "QuestPrompt", "Open Quests",  "Daily Board", function(player)
+	sendQuestUpdate(player); OpenQuests:FireClient(player)
+end)
+
+-- ──────────────────────────────────────────
+-- REMOTE HANDLERS
+-- ──────────────────────────────────────────
+RequestJoinMatch.OnServerEvent:Connect(joinMatch)
+RequestLeaveMatch.OnServerEvent:Connect(leaveMatch)
+RequestShopData.OnServerEvent:Connect(sendShopUpdate)
+
+RequestPurchase.OnServerEvent:Connect(function(player, itemId)
+	local item = getShopItem(itemId); if not item then return end
+	local inventory = getInventory(player)
+	if inventory.owned[item.id] then
+		inventory.equipped[item.category] = item.id
+		applyCosmetics(player); sendShopUpdate(player); sendToast(player, "Equipped", item.name, "shop")
+		return
+	end
+	local coins = getLeaderValue(player, "Coins")
+	if not coins or coins.Value < item.cost then
+		sendToast(player, "Need more coins", item.name.." costs "..item.cost, "shop"); sendShopUpdate(player); return
+	end
+	coins.Value -= item.cost
+	inventory.owned[item.id]=true; inventory.equipped[item.category]=item.id
+	applyCosmetics(player); sendShopUpdate(player); sendToast(player, "Purchased", item.name, "shop")
+	savePlayerData(player)
+end)
+
+RequestEquipItem.OnServerEvent:Connect(function(player, itemId)
+	local item = getShopItem(itemId); if not item then return end
+	local inventory = getInventory(player)
+	if not inventory.owned[item.id] then
+		sendToast(player, "Locked", "Buy this item first.", "shop"); sendShopUpdate(player); return
+	end
+	inventory.equipped[item.category] = item.id
+	applyCosmetics(player); sendShopUpdate(player); sendToast(player, "Equipped", item.name, "shop")
+	savePlayerData(player)
+end)
+
+local VALID_EMOTE_IDS = { wave=true, laugh=true, taunt=true, dance=true }
+local EMOTE_TO_ITEM   = { wave="emote_wave", laugh="emote_laugh", taunt="emote_taunt", dance="emote_dance" }
+
+RequestEmote.OnServerEvent:Connect(function(player, emoteId)
+	if type(emoteId)~="string" or not VALID_EMOTE_IDS[emoteId] then return end
+	local itemId = EMOTE_TO_ITEM[emoteId]
+	local inventory = getInventory(player)
+	if not itemId or not inventory.owned[itemId] then
+		sendToast(player, "Locked", "Buy this emote in the shop first.", "shop"); return
+	end
+	local now = os.clock()
+	local lastUse = lastEmoteUse[player.UserId] or -math.huge
+	if now - lastUse < CONFIG.EMOTE_COOLDOWN then return end
+	lastEmoteUse[player.UserId] = now
+	fireToMatch(PlayEmote, player, emoteId)
+end)
+
+RequestTargetAbility.OnServerEvent:Connect(function(player)
+	if player~=currentTarget or not roundActive then
+		AbilityCooldownUpdate:FireClient(player, 0, player==currentTarget); return
+	end
+	local now = os.clock()
+	local lastUse = lastTargetAbilityUse[player.UserId] or -math.huge
+	local remaining = CONFIG.TARGET_ABILITY_COOLDOWN - (now-lastUse)
+	if remaining > 0 then AbilityCooldownUpdate:FireClient(player, math.ceil(remaining), false); return end
+	lastTargetAbilityUse[player.UserId] = now
+	AbilityCooldownUpdate:FireClient(player, CONFIG.TARGET_ABILITY_COOLDOWN, false)
+	fadeCharacter(player, CONFIG.TARGET_ABILITY_TRANSPARENCY)
+	setMovement(player, CONFIG.TARGET_ABILITY_SPEED, CONFIG.TARGET_JUMP_POWER)
+	TargetAbilityEffect:FireAllClients(player, true)
+	task.delay(CONFIG.TARGET_ABILITY_DURATION, function()
+		restoreTransparency(player); TargetAbilityEffect:FireAllClients(player, false)
+		if player==currentTarget and roundActive then setMovement(player, CONFIG.TARGET_SPEED, CONFIG.TARGET_JUMP_POWER)
+		else resetPlayerMovement(player) end
+	end)
+	task.delay(CONFIG.TARGET_ABILITY_COOLDOWN, function()
+		if player==currentTarget and roundActive then AbilityCooldownUpdate:FireClient(player, 0, true) end
+	end)
+end)
+
+RequestHunterBoost.OnServerEvent:Connect(function(player)
+	if player==currentTarget or not roundActive or not isInMatch(player) then
+		HunterBoostUpdate:FireClient(player, 0, false); return
+	end
+	local now = os.clock()
+	local lastUse = lastHunterBoostUse[player.UserId] or -math.huge
+	local remaining = CONFIG.HUNTER_BOOST_COOLDOWN - (now-lastUse)
+	if remaining > 0 then HunterBoostUpdate:FireClient(player, math.ceil(remaining), false); return end
+	lastHunterBoostUse[player.UserId] = now
+	HunterBoostUpdate:FireClient(player, CONFIG.HUNTER_BOOST_COOLDOWN, false)
+	setMovement(player, CONFIG.HUNTER_BOOST_SPEED, CONFIG.NORMAL_JUMP_POWER)
+	task.delay(CONFIG.HUNTER_BOOST_DURATION, function()
+		if player~=currentTarget then resetPlayerMovement(player) end
+	end)
+	task.delay(CONFIG.HUNTER_BOOST_COOLDOWN, function()
+		if player~=currentTarget and roundActive and isInMatch(player) then
+			HunterBoostUpdate:FireClient(player, 0, true)
+		end
+	end)
+end)
+
+-- ──────────────────────────────────────────
+-- PLAYER ADDED / REMOVING
+-- ──────────────────────────────────────────
+Players.PlayerAdded:Connect(function(player)
+	-- Load data FIRST, then setup leaderstats
+	local stats, inventory = loadPlayerData(player)
+	setupLeaderstats(player, stats)
+	playerInventory[player.UserId] = inventory
+	player:SetAttribute("InMatch", false)
+
+	player.CharacterAdded:Connect(function()
+		task.wait(0.25)
+		if isInMatch(player) then teleportToArena(player) else teleportToLobby(player) end
+		if player==currentTarget and roundActive then
+			setMovement(player, CONFIG.TARGET_SPEED, CONFIG.TARGET_JUMP_POWER)
+		else
+			resetPlayerMovement(player)
+		end
+		applyCosmetics(player)
+	end)
+
+	task.defer(function()
+		sendQuestUpdate(player); sendShopUpdate(player); sendMatchState(player)
+		broadcastLeaderboard()
+	end)
+
+	-- Auto-save loop for this player
+	task.spawn(function()
+		while player.Parent do
+			task.wait(CONFIG.AUTO_SAVE_INTERVAL)
+			if player.Parent then savePlayerData(player) end
+		end
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	savePlayerData(player)
+	restoreTransparency(player)
+	lastTargetAbilityUse[player.UserId] = nil
+	lastHunterBoostUse[player.UserId]   = nil
+	lastEmoteUse[player.UserId]         = nil
+	questProgress[player.UserId]        = nil
+	playerInventory[player.UserId]      = nil
+	if player==currentTarget and roundActive then finishHunt("caught",nil) end
+	task.delay(1, broadcastLeaderboard)
+end)
+
+-- Catch players already in server on hot-reload
+for _, player in ipairs(Players:GetPlayers()) do
+	local stats, inventory = loadPlayerData(player)
+	setupLeaderstats(player, stats)
+	playerInventory[player.UserId] = inventory
+	player:SetAttribute("InMatch", player:GetAttribute("InMatch") == true)
+	sendQuestUpdate(player); sendShopUpdate(player); sendMatchState(player)
+end
+
+-- ──────────────────────────────────────────
+-- LEADERBOARD BROADCAST LOOP
+-- ──────────────────────────────────────────
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.LEADERBOARD_UPDATE_INTERVAL)
+		broadcastLeaderboard()
+	end
+end)
+
+-- ──────────────────────────────────────────
+-- ROUND LOOP
+-- ──────────────────────────────────────────
+task.spawn(function()
+	while true do
+		while countPlayers() < CONFIG.MIN_PLAYERS do
+			sendTimer("Lobby", 0)
+			fireToMatch(RoundAnnouncement, "Need more players to start. Invite friends!", "waiting", 2)
+			sendMatchStateToAll(); task.wait(2)
+		end
+		runIntermission()
+		local target = chooseTarget()
+		if target then runAnnouncement(target); runHunt(target)
+		else task.wait(2) end
+	end
+end)

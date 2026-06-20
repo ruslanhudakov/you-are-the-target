@@ -1,0 +1,936 @@
+-- Target Hunt V6 - HUD Client Script
+-- CHANGES from V5:
+--   • Emote button replaced with a small hint label: "Анимации: [V]"
+--   • Emote wheel still works via V key (no button needed)
+--   • Quest panel icons use text glyphs that render reliably in Roblox
+--   • Ability button icons fixed
+-- Place in StarterPlayer > StarterPlayerScripts
+
+local Players         = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService      = game:GetService("RunService")
+local TweenService    = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local localPlayer = Players.LocalPlayer
+local camera      = workspace.CurrentCamera
+
+local ALARM_SOUND_ID = ""
+local KILL_SOUND_ID  = ""
+
+print("[TargetHunt] V6 HUD client started.")
+
+-- ──────────────────────────────────────────
+-- DESIGN TOKENS
+-- ──────────────────────────────────────────
+local FONT_DISPLAY    = Enum.Font.FredokaOne
+local FONT_BODY       = Enum.Font.GothamBold
+local FONT_BODY_BLACK = Enum.Font.GothamBlack
+
+local COLOR_BG        = Color3.fromRGB(16, 18, 24)
+local COLOR_BG_LIGHT  = Color3.fromRGB(26, 29, 38)
+local COLOR_BG_CARD   = Color3.fromRGB(31, 35, 44)
+local COLOR_DANGER    = Color3.fromRGB(255, 59, 78)
+local COLOR_DANGER_DEEP = Color3.fromRGB(176, 16, 38)
+local COLOR_GOLD      = Color3.fromRGB(255, 200, 60)
+local COLOR_SUCCESS   = Color3.fromRGB(61, 220, 132)
+local COLOR_INFO      = Color3.fromRGB(120, 180, 255)
+local COLOR_TEXT      = Color3.fromRGB(255, 255, 255)
+local COLOR_TEXT_DIM  = Color3.fromRGB(180, 190, 205)
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, radius or 10); c.Parent = parent; return c
+end
+local function stroke(parent, color, thickness, transparency)
+	local s = Instance.new("UIStroke"); s.Color=color or Color3.new(0,0,0); s.Thickness=thickness or 1; s.Transparency=transparency or 0.5; s.Parent=parent; return s
+end
+local function gradient(parent, colorSeq, rotation)
+	local g = Instance.new("UIGradient"); g.Color=colorSeq; g.Rotation=rotation or 90; g.Parent=parent; return g
+end
+local function pad(parent, l, r, t, b)
+	local p = Instance.new("UIPadding")
+	p.PaddingLeft=UDim.new(0,l or 0); p.PaddingRight=UDim.new(0,r or 0)
+	p.PaddingTop=UDim.new(0,t or 0); p.PaddingBottom=UDim.new(0,b or 0)
+	p.Parent=parent; return p
+end
+
+-- ──────────────────────────────────────────
+-- BOOT STATUS
+-- ──────────────────────────────────────────
+local bootGui = Instance.new("ScreenGui")
+bootGui.Name="TargetHuntBootStatus"; bootGui.ResetOnSpawn=false; bootGui.IgnoreGuiInset=true
+bootGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+local bootLabel = Instance.new("TextLabel")
+bootLabel.AnchorPoint=Vector2.new(0.5,0); bootLabel.Position=UDim2.fromScale(0.5,0.01)
+bootLabel.Size=UDim2.fromOffset(460,34); bootLabel.BackgroundColor3=COLOR_BG
+bootLabel.BackgroundTransparency=0.08; bootLabel.BorderSizePixel=0
+bootLabel.Font=FONT_BODY_BLACK; bootLabel.TextColor3=COLOR_TEXT
+bootLabel.TextScaled=true; bootLabel.Text="Target Hunt loading..."
+bootLabel.Parent=bootGui; corner(bootLabel,10)
+
+local remotesFolder = ReplicatedStorage:WaitForChild("TargetHuntRemotes", 10)
+if not remotesFolder then
+	bootLabel.Text = "Target Hunt server not found."; bootLabel.TextColor3 = COLOR_DANGER; return
+end
+
+local function waitRemote(name)
+	local r = remotesFolder:WaitForChild(name, 10)
+	if not r then bootLabel.Text="Missing: "..name; bootLabel.TextColor3=COLOR_DANGER end
+	return r
+end
+
+local SetTarget          = waitRemote("SetTarget")
+local ClearTarget        = waitRemote("ClearTarget")
+local RoundTimerUpdate   = waitRemote("RoundTimerUpdate")
+local RoundAnnouncement  = waitRemote("RoundAnnouncement")
+local TargetCaught       = waitRemote("TargetCaught")
+local RequestTargetAbility = waitRemote("RequestTargetAbility")
+local AbilityCooldownUpdate = waitRemote("AbilityCooldownUpdate")
+local TargetAbilityEffect = waitRemote("TargetAbilityEffect")
+local CoinCollected      = waitRemote("CoinCollected")
+local RoundStatsUpdate   = waitRemote("RoundStatsUpdate")
+local RequestHunterBoost = waitRemote("RequestHunterBoost")
+local HunterBoostUpdate  = waitRemote("HunterBoostUpdate")
+local QuestUpdate        = waitRemote("QuestUpdate")
+local ProgressToast      = waitRemote("ProgressToast")
+local BountyUpdate       = waitRemote("BountyUpdate")
+local KillEffectTrigger  = waitRemote("KillEffectTrigger")
+local RequestEmote       = waitRemote("RequestEmote")
+local PlayEmote          = waitRemote("PlayEmote")
+
+bootLabel.Text = "Target Hunt V6 ready!"; bootLabel.TextColor3 = COLOR_SUCCESS
+task.delay(1.4, function() if bootGui then bootGui:Destroy() end end)
+
+-- ──────────────────────────────────────────
+-- STATE
+-- ──────────────────────────────────────────
+local currentTarget    = nil
+local currentPhase     = ""
+local targetHidden     = false
+local targetCharacterConnection = nil
+local highlight        = nil
+local billboard        = nil
+local billboardText    = nil
+local billboardDistance = nil
+local targetAbilityReady = true
+local hunterBoostReady   = true
+
+-- ──────────────────────────────────────────
+-- ROOT GUI
+-- ──────────────────────────────────────────
+local gui = Instance.new("ScreenGui")
+gui.Name="TargetHuntGui"; gui.ResetOnSpawn=false; gui.IgnoreGuiInset=true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+-- ──────────────────────────────────────────
+-- TOP BAR
+-- ──────────────────────────────────────────
+local topBar = Instance.new("Frame")
+topBar.Name="TopBar"; topBar.AnchorPoint=Vector2.new(0.5,0)
+topBar.Position=UDim2.fromScale(0.5,0.025); topBar.Size=UDim2.fromOffset(620,64)
+topBar.BackgroundColor3=COLOR_BG; topBar.BackgroundTransparency=0.08; topBar.BorderSizePixel=0
+topBar.Parent=gui; corner(topBar,14); stroke(topBar,Color3.fromRGB(0,0,0),1,0.65)
+
+local topBarSize = Instance.new("UISizeConstraint")
+topBarSize.MaxSize=Vector2.new(620,64); topBarSize.MinSize=Vector2.new(360,56); topBarSize.Parent=topBar
+
+local timerStripBg = Instance.new("Frame")
+timerStripBg.AnchorPoint=Vector2.new(0.5,1); timerStripBg.Position=UDim2.new(0.5,0,1,0)
+timerStripBg.Size=UDim2.new(1,0,0,5); timerStripBg.BackgroundColor3=Color3.fromRGB(0,0,0)
+timerStripBg.BackgroundTransparency=0.5; timerStripBg.BorderSizePixel=0; timerStripBg.ZIndex=2
+timerStripBg.Parent=topBar; corner(timerStripBg,4)
+
+local timerStripFill = Instance.new("Frame")
+timerStripFill.Name="TimerStripFill"; timerStripFill.Size=UDim2.fromScale(1,1)
+timerStripFill.BackgroundColor3=COLOR_INFO; timerStripFill.BorderSizePixel=0; timerStripFill.ZIndex=3
+timerStripFill.Parent=timerStripBg; corner(timerStripFill,4)
+
+local timerSection = Instance.new("Frame")
+timerSection.Name="TimerSection"; timerSection.Position=UDim2.fromOffset(18,6)
+timerSection.Size=UDim2.fromOffset(190,52); timerSection.BackgroundTransparency=1; timerSection.Parent=topBar
+
+local phaseLabel = Instance.new("TextLabel")
+phaseLabel.Name="PhaseLabel"; phaseLabel.Size=UDim2.new(1,0,0,18); phaseLabel.Position=UDim2.fromOffset(0,4)
+phaseLabel.BackgroundTransparency=1; phaseLabel.Font=FONT_BODY; phaseLabel.TextColor3=COLOR_TEXT_DIM
+phaseLabel.TextScaled=true; phaseLabel.TextXAlignment=Enum.TextXAlignment.Left
+phaseLabel.Text="LOADING"; phaseLabel.Parent=timerSection
+
+local timerLabel = Instance.new("TextLabel")
+timerLabel.Name="TimerLabel"; timerLabel.Size=UDim2.new(1,0,0,30); timerLabel.Position=UDim2.fromOffset(0,20)
+timerLabel.BackgroundTransparency=1; timerLabel.Font=FONT_DISPLAY; timerLabel.TextColor3=COLOR_TEXT
+timerLabel.TextScaled=true; timerLabel.TextXAlignment=Enum.TextXAlignment.Left
+timerLabel.Text="--"; timerLabel.Parent=timerSection
+
+local roleBadge = Instance.new("Frame")
+roleBadge.Name="RoleBadge"; roleBadge.AnchorPoint=Vector2.new(0.5,0.5)
+roleBadge.Position=UDim2.fromScale(0.5,0.46); roleBadge.Size=UDim2.fromOffset(220,36)
+roleBadge.BackgroundColor3=COLOR_BG_LIGHT; roleBadge.BorderSizePixel=0; roleBadge.Parent=topBar; corner(roleBadge,18)
+
+local roleLabel = Instance.new("TextLabel")
+roleLabel.Name="RoleLabel"; roleLabel.Size=UDim2.fromScale(1,1); roleLabel.BackgroundTransparency=1
+roleLabel.Font=FONT_BODY_BLACK; roleLabel.TextColor3=COLOR_TEXT_DIM; roleLabel.TextScaled=true
+roleLabel.Text="⏳ WAITING"; roleLabel.Parent=roleBadge; pad(roleLabel,8,8,2,2)
+
+local bountySection = Instance.new("Frame")
+bountySection.Name="BountySection"; bountySection.AnchorPoint=Vector2.new(1,0)
+bountySection.Position=UDim2.new(1,-18,0,6); bountySection.Size=UDim2.fromOffset(190,52)
+bountySection.BackgroundTransparency=1; bountySection.Parent=topBar
+
+local bountyTag = Instance.new("TextLabel")
+bountyTag.Name="BountyTag"; bountyTag.Size=UDim2.new(1,0,0,18); bountyTag.Position=UDim2.fromOffset(0,4)
+bountyTag.BackgroundTransparency=1; bountyTag.Font=FONT_BODY; bountyTag.TextColor3=COLOR_TEXT_DIM
+bountyTag.TextScaled=true; bountyTag.TextXAlignment=Enum.TextXAlignment.Right
+bountyTag.Text="BOUNTY"; bountyTag.Parent=bountySection
+
+local bountyLabel = Instance.new("TextLabel")
+bountyLabel.Name="BountyLabel"; bountyLabel.Size=UDim2.new(1,0,0,30); bountyLabel.Position=UDim2.fromOffset(0,20)
+bountyLabel.BackgroundTransparency=1; bountyLabel.Font=FONT_DISPLAY; bountyLabel.TextColor3=COLOR_GOLD
+bountyLabel.TextScaled=true; bountyLabel.TextXAlignment=Enum.TextXAlignment.Right
+bountyLabel.Text="◉ 0"; bountyLabel.Parent=bountySection
+
+-- ──────────────────────────────────────────
+-- ANNOUNCEMENT
+-- ──────────────────────────────────────────
+local announcementHolder = Instance.new("Frame")
+announcementHolder.Name="AnnouncementHolder"; announcementHolder.AnchorPoint=Vector2.new(0.5,0.5)
+announcementHolder.Position=UDim2.fromScale(0.5,0.26); announcementHolder.Size=UDim2.fromScale(0.92,0.12)
+announcementHolder.BackgroundTransparency=1; announcementHolder.Parent=gui
+
+local announcementLabel = Instance.new("TextLabel")
+announcementLabel.Name="AnnouncementLabel"; announcementLabel.AnchorPoint=Vector2.new(0.5,0.5)
+announcementLabel.Position=UDim2.fromScale(0.5,0.5); announcementLabel.Size=UDim2.fromScale(1,1)
+announcementLabel.BackgroundTransparency=1; announcementLabel.Font=FONT_DISPLAY
+announcementLabel.TextColor3=COLOR_TEXT; announcementLabel.TextStrokeTransparency=0.15
+announcementLabel.TextStrokeColor3=Color3.fromRGB(0,0,0); announcementLabel.TextScaled=true
+announcementLabel.TextTransparency=1; announcementLabel.Text=""; announcementLabel.Parent=announcementHolder
+
+local flash = Instance.new("Frame")
+flash.Name="RedFlash"; flash.Size=UDim2.fromScale(1,1); flash.BackgroundColor3=COLOR_DANGER_DEEP
+flash.BackgroundTransparency=1; flash.BorderSizePixel=0; flash.ZIndex=0; flash.Parent=gui
+
+-- ──────────────────────────────────────────
+-- TARGET ARROW
+-- ──────────────────────────────────────────
+local targetArrow = Instance.new("Frame")
+targetArrow.Name="TargetArrow"; targetArrow.AnchorPoint=Vector2.new(0.5,0)
+targetArrow.Size=UDim2.fromOffset(150,48); targetArrow.BackgroundColor3=COLOR_DANGER_DEEP
+targetArrow.BorderSizePixel=0; targetArrow.Visible=false; targetArrow.Parent=gui
+corner(targetArrow,12); stroke(targetArrow,Color3.fromRGB(255,130,140),1.5,0.35)
+gradient(targetArrow, ColorSequence.new(COLOR_DANGER, COLOR_DANGER_DEEP), 90)
+
+local targetArrowGlyph = Instance.new("TextLabel")
+targetArrowGlyph.Name="Glyph"; targetArrowGlyph.Size=UDim2.fromOffset(32,48)
+targetArrowGlyph.Position=UDim2.fromOffset(6,0); targetArrowGlyph.BackgroundTransparency=1
+targetArrowGlyph.Font=FONT_BODY_BLACK; targetArrowGlyph.TextColor3=COLOR_TEXT
+targetArrowGlyph.TextScaled=true; targetArrowGlyph.Text="▼"; targetArrowGlyph.Parent=targetArrow
+
+local targetArrowText = Instance.new("TextLabel")
+targetArrowText.Name="DistanceLabel"; targetArrowText.Size=UDim2.new(1,-38,1,0)
+targetArrowText.Position=UDim2.fromOffset(36,0); targetArrowText.BackgroundTransparency=1
+targetArrowText.Font=FONT_DISPLAY; targetArrowText.TextColor3=COLOR_TEXT; targetArrowText.TextScaled=true
+targetArrowText.TextXAlignment=Enum.TextXAlignment.Left; targetArrowText.Text="0m"; targetArrowText.Parent=targetArrow
+
+-- ──────────────────────────────────────────
+-- COIN POPUP
+-- ──────────────────────────────────────────
+local coinPopup = Instance.new("TextLabel")
+coinPopup.Name="CoinPopup"; coinPopup.AnchorPoint=Vector2.new(0.5,0)
+coinPopup.Position=UDim2.fromScale(0.5,0.105); coinPopup.Size=UDim2.fromOffset(170,38)
+coinPopup.BackgroundColor3=COLOR_GOLD; coinPopup.BackgroundTransparency=1
+coinPopup.BorderSizePixel=0; coinPopup.Font=FONT_BODY_BLACK; coinPopup.TextColor3=Color3.fromRGB(40,30,8)
+coinPopup.TextScaled=true; coinPopup.TextTransparency=1; coinPopup.Text="◉ +3"; coinPopup.Parent=gui
+corner(coinPopup,10)
+
+-- ──────────────────────────────────────────
+-- QUEST PANEL
+-- ──────────────────────────────────────────
+local questPanel = Instance.new("Frame")
+questPanel.Name="QuestPanel"; questPanel.Position=UDim2.fromOffset(20,100)
+questPanel.Size=UDim2.fromOffset(282,188); questPanel.BackgroundColor3=COLOR_BG
+questPanel.BackgroundTransparency=0.1; questPanel.BorderSizePixel=0; questPanel.Parent=gui
+corner(questPanel,14); stroke(questPanel,Color3.fromRGB(0,0,0),1,0.65)
+
+local questTitle = Instance.new("TextLabel")
+questTitle.Name="QuestTitle"; questTitle.Position=UDim2.fromOffset(16,10)
+questTitle.Size=UDim2.fromOffset(250,24); questTitle.BackgroundTransparency=1
+questTitle.Font=FONT_DISPLAY; questTitle.TextColor3=COLOR_TEXT; questTitle.TextScaled=true
+questTitle.TextXAlignment=Enum.TextXAlignment.Left; questTitle.Text="DAILY QUESTS"; questTitle.Parent=questPanel
+
+local function makeQuestRow(name, glyph, label, y)
+	local row = Instance.new("Frame")
+	row.Name=name; row.Position=UDim2.fromOffset(14,y); row.Size=UDim2.fromOffset(254,46)
+	row.BackgroundTransparency=1; row.Parent=questPanel
+
+	local glyphL = Instance.new("TextLabel")
+	glyphL.Size=UDim2.fromOffset(24,24); glyphL.BackgroundTransparency=1
+	glyphL.Font=FONT_BODY_BLACK; glyphL.TextColor3=COLOR_TEXT_DIM
+	glyphL.TextScaled=true; glyphL.Text=glyph; glyphL.Parent=row
+
+	local titleL = Instance.new("TextLabel")
+	titleL.Position=UDim2.fromOffset(28,0); titleL.Size=UDim2.fromOffset(150,18)
+	titleL.BackgroundTransparency=1; titleL.Font=FONT_BODY; titleL.TextColor3=COLOR_TEXT
+	titleL.TextScaled=true; titleL.TextXAlignment=Enum.TextXAlignment.Left
+	titleL.Text=label; titleL.Parent=row
+
+	local countL = Instance.new("TextLabel")
+	countL.Name="CountLabel"; countL.AnchorPoint=Vector2.new(1,0)
+	countL.Position=UDim2.new(1,0,0,0); countL.Size=UDim2.fromOffset(70,18)
+	countL.BackgroundTransparency=1; countL.Font=FONT_BODY_BLACK; countL.TextColor3=COLOR_TEXT_DIM
+	countL.TextScaled=true; countL.TextXAlignment=Enum.TextXAlignment.Right
+	countL.Text="0/0"; countL.Parent=row
+
+	local barBg = Instance.new("Frame")
+	barBg.Position=UDim2.fromOffset(28,24); barBg.Size=UDim2.fromOffset(226,8)
+	barBg.BackgroundColor3=Color3.fromRGB(0,0,0); barBg.BackgroundTransparency=0.4
+	barBg.BorderSizePixel=0; barBg.Parent=row; corner(barBg,4)
+
+	local barFill = Instance.new("Frame")
+	barFill.Name="BarFill"; barFill.Size=UDim2.fromScale(0,1); barFill.BackgroundColor3=COLOR_INFO
+	barFill.BorderSizePixel=0; barFill.Parent=barBg; corner(barFill,4)
+
+	return row, countL, barFill
+end
+
+-- Using Roblox-safe text glyphs
+local collectRow, collectCount, collectBar = makeQuestRow("CollectQuest", "◉", "Collect coins",      38)
+local catchRow,   catchCount,   catchBar   = makeQuestRow("CatchQuest",   "⚔", "Catch target",       88)
+local surviveRow, surviveCount, surviveBar = makeQuestRow("SurviveQuest", "♥", "Survive as target",  138)
+
+-- ──────────────────────────────────────────
+-- RESULT PANEL
+-- ──────────────────────────────────────────
+local resultPanel = Instance.new("Frame")
+resultPanel.Name="ResultPanel"; resultPanel.AnchorPoint=Vector2.new(0.5,0.5)
+resultPanel.Position=UDim2.fromScale(0.5,0.46); resultPanel.Size=UDim2.fromOffset(440,200)
+resultPanel.BackgroundColor3=COLOR_BG; resultPanel.BackgroundTransparency=0.05
+resultPanel.BorderSizePixel=0; resultPanel.Visible=false; resultPanel.Parent=gui
+corner(resultPanel,16); stroke(resultPanel,Color3.fromRGB(0,0,0),1,0.5)
+
+local resultAccent = Instance.new("Frame")
+resultAccent.Name="Accent"; resultAccent.Size=UDim2.new(1,0,0,6)
+resultAccent.BackgroundColor3=COLOR_GOLD; resultAccent.BorderSizePixel=0; resultAccent.Parent=resultPanel
+corner(resultAccent,16)
+
+local resultTitle = Instance.new("TextLabel")
+resultTitle.Name="ResultTitle"; resultTitle.Position=UDim2.fromOffset(26,24)
+resultTitle.Size=UDim2.fromOffset(388,46); resultTitle.BackgroundTransparency=1
+resultTitle.Font=FONT_DISPLAY; resultTitle.TextColor3=COLOR_TEXT; resultTitle.TextScaled=true
+resultTitle.Text="ROUND OVER"; resultTitle.Parent=resultPanel
+
+local resultBody = Instance.new("TextLabel")
+resultBody.Name="ResultBody"; resultBody.Position=UDim2.fromOffset(28,82)
+resultBody.Size=UDim2.fromOffset(384,96); resultBody.BackgroundTransparency=1
+resultBody.Font=FONT_BODY; resultBody.TextColor3=COLOR_TEXT_DIM; resultBody.TextScaled=true
+resultBody.TextWrapped=true; resultBody.Text=""; resultBody.Parent=resultPanel
+
+-- ──────────────────────────────────────────
+-- TOASTS
+-- ──────────────────────────────────────────
+local toastArea = Instance.new("Frame")
+toastArea.Name="ToastArea"; toastArea.AnchorPoint=Vector2.new(1,0)
+toastArea.Position=UDim2.new(1,-20,0,100); toastArea.Size=UDim2.fromOffset(290,320)
+toastArea.BackgroundTransparency=1; toastArea.Parent=gui
+
+-- ──────────────────────────────────────────
+-- ABILITY BUTTONS (right side, stacked above emote hint)
+-- ──────────────────────────────────────────
+local function makeAbilityButton(name, glyph, text, color)
+	local button = Instance.new("TextButton")
+	button.Name=name; button.AnchorPoint=Vector2.new(1,1)
+	button.Size=UDim2.fromOffset(184,60); button.BackgroundColor3=COLOR_BG_LIGHT
+	button.BorderSizePixel=0; button.AutoButtonColor=true; button.Text=""
+	button.Visible=false; button.Parent=gui; corner(button,14); stroke(button,color,1.5,0.3)
+
+	local glyphL = Instance.new("TextLabel")
+	glyphL.Name="Glyph"; glyphL.Size=UDim2.fromOffset(40,40); glyphL.Position=UDim2.fromOffset(10,10)
+	glyphL.BackgroundColor3=color; glyphL.BackgroundTransparency=0.1; glyphL.Font=FONT_BODY_BLACK
+	glyphL.TextColor3=COLOR_TEXT; glyphL.TextScaled=true; glyphL.Text=glyph; glyphL.Parent=button; corner(glyphL,10)
+
+	local textL = Instance.new("TextLabel")
+	textL.Name="Label"; textL.Position=UDim2.fromOffset(58,8); textL.Size=UDim2.fromOffset(118,22)
+	textL.BackgroundTransparency=1; textL.Font=FONT_BODY_BLACK; textL.TextColor3=COLOR_TEXT
+	textL.TextScaled=true; textL.TextXAlignment=Enum.TextXAlignment.Left; textL.Text=text; textL.Parent=button
+
+	local statusL = Instance.new("TextLabel")
+	statusL.Name="Status"; statusL.Position=UDim2.fromOffset(58,30); statusL.Size=UDim2.fromOffset(118,20)
+	statusL.BackgroundTransparency=1; statusL.Font=FONT_BODY; statusL.TextColor3=COLOR_TEXT_DIM
+	statusL.TextScaled=true; statusL.TextXAlignment=Enum.TextXAlignment.Left; statusL.Text="Ready"; statusL.Parent=button
+
+	return button, statusL
+end
+
+-- Ability buttons: positioned above the emote hint
+local targetAbilityButton, targetAbilityStatus = makeAbilityButton("TargetAbilityButton", "★", "FADE  [Q]", COLOR_DANGER)
+targetAbilityButton.Position = UDim2.new(1, -28, 1, -140)
+
+local hunterBoostButton, hunterBoostStatus = makeAbilityButton("HunterBoostButton", "!", "SPRINT  [E]", COLOR_INFO)
+hunterBoostButton.Position = UDim2.new(1, -28, 1, -140)
+
+-- ──────────────────────────────────────────
+-- EMOTE HINT LABEL (replaces button)
+-- Shows: "Анимации  [V]"
+-- ──────────────────────────────────────────
+local emoteHint = Instance.new("Frame")
+emoteHint.Name          = "EmoteHint"
+emoteHint.AnchorPoint   = Vector2.new(1, 1)
+emoteHint.Position      = UDim2.new(1, -28, 1, -78)
+emoteHint.Size          = UDim2.fromOffset(184, 44)
+emoteHint.BackgroundColor3 = COLOR_BG_CARD
+emoteHint.BackgroundTransparency = 0.1
+emoteHint.BorderSizePixel = 0
+emoteHint.Parent        = gui
+corner(emoteHint, 12)
+stroke(emoteHint, COLOR_SUCCESS, 1.5, 0.4)
+
+local emoteHintIcon = Instance.new("TextLabel")
+emoteHintIcon.Size             = UDim2.fromOffset(36, 36)
+emoteHintIcon.Position         = UDim2.fromOffset(8, 4)
+emoteHintIcon.BackgroundColor3 = COLOR_SUCCESS
+emoteHintIcon.BackgroundTransparency = 0.1
+emoteHintIcon.Font             = FONT_BODY_BLACK
+emoteHintIcon.TextColor3       = Color3.fromRGB(10, 40, 20)
+emoteHintIcon.TextScaled       = true
+emoteHintIcon.Text             = "♪"
+emoteHintIcon.Parent           = emoteHint
+corner(emoteHintIcon, 9)
+
+local emoteHintText = Instance.new("TextLabel")
+emoteHintText.Position         = UDim2.fromOffset(50, 4)
+emoteHintText.Size             = UDim2.fromOffset(128, 18)
+emoteHintText.BackgroundTransparency = 1
+emoteHintText.Font             = FONT_BODY_BLACK
+emoteHintText.TextColor3       = COLOR_TEXT
+emoteHintText.TextScaled       = true
+emoteHintText.TextXAlignment   = Enum.TextXAlignment.Left
+emoteHintText.Text             = "Анимации"
+emoteHintText.Parent           = emoteHint
+
+local emoteHintKey = Instance.new("TextLabel")
+emoteHintKey.Position          = UDim2.fromOffset(50, 24)
+emoteHintKey.Size              = UDim2.fromOffset(128, 16)
+emoteHintKey.BackgroundTransparency = 1
+emoteHintKey.Font              = FONT_BODY
+emoteHintKey.TextColor3        = COLOR_SUCCESS
+emoteHintKey.TextScaled        = true
+emoteHintKey.TextXAlignment    = Enum.TextXAlignment.Left
+emoteHintKey.Text              = "Нажми  [V]"
+emoteHintKey.Parent            = emoteHint
+
+-- ──────────────────────────────────────────
+-- SOUNDS
+-- ──────────────────────────────────────────
+local alarmSound = Instance.new("Sound"); alarmSound.Name="TargetAlarm"; alarmSound.Volume=0.55; alarmSound.Parent=gui
+if ALARM_SOUND_ID ~= "" then alarmSound.SoundId = ALARM_SOUND_ID end
+
+local killSound = Instance.new("Sound"); killSound.Name="KillSound"; killSound.Volume=0.6; killSound.Parent=gui
+if KILL_SOUND_ID ~= "" then killSound.SoundId = KILL_SOUND_ID end
+
+-- ──────────────────────────────────────────
+-- EMOTE WHEEL (V key)
+-- ──────────────────────────────────────────
+local EMOTES = {
+	{ id="wave",  glyph="~", name="Wave"  },
+	{ id="laugh", glyph="=", name="Laugh" },
+	{ id="taunt", glyph="!", name="Taunt" },
+	{ id="dance", glyph="#", name="Dance" },
+}
+
+local EMOTE_GLYPH_DISPLAY = {
+	wave  = "👋",
+	laugh = "😂",
+	taunt = "😈",
+	dance = "💃",
+}
+
+local emoteOverlay = Instance.new("Frame")
+emoteOverlay.Name="EmoteOverlay"; emoteOverlay.Size=UDim2.fromScale(1,1)
+emoteOverlay.BackgroundColor3=Color3.fromRGB(0,0,0); emoteOverlay.BackgroundTransparency=1
+emoteOverlay.Visible=false; emoteOverlay.Parent=gui
+
+local emoteWheel = Instance.new("Frame")
+emoteWheel.Name="EmoteWheel"; emoteWheel.AnchorPoint=Vector2.new(0.5,0.5)
+emoteWheel.Position=UDim2.fromScale(0.5,0.5); emoteWheel.Size=UDim2.fromOffset(380,100)
+emoteWheel.BackgroundColor3=COLOR_BG; emoteWheel.BackgroundTransparency=0.05
+emoteWheel.BorderSizePixel=0; emoteWheel.Parent=emoteOverlay; corner(emoteWheel,16)
+stroke(emoteWheel,Color3.fromRGB(0,0,0),1,0.5)
+
+-- Header inside the wheel
+local emoteWheelHeader = Instance.new("TextLabel")
+emoteWheelHeader.Size=UDim2.new(1,0,0,22); emoteWheelHeader.Position=UDim2.fromOffset(0,-26)
+emoteWheelHeader.BackgroundTransparency=1; emoteWheelHeader.Font=FONT_BODY
+emoteWheelHeader.TextColor3=COLOR_TEXT_DIM; emoteWheelHeader.TextScaled=true
+emoteWheelHeader.Text="ВЫБЕРИТЕ АНИМАЦИЮ"; emoteWheelHeader.Parent=emoteWheel
+
+local emoteLayout = Instance.new("UIListLayout")
+emoteLayout.FillDirection=Enum.FillDirection.Horizontal; emoteLayout.Padding=UDim.new(0,10)
+emoteLayout.HorizontalAlignment=Enum.HorizontalAlignment.Center
+emoteLayout.VerticalAlignment=Enum.VerticalAlignment.Center; emoteLayout.Parent=emoteWheel
+
+for _, emoteData in ipairs(EMOTES) do
+	local emoteBtn = Instance.new("TextButton")
+	emoteBtn.Name=emoteData.id; emoteBtn.Size=UDim2.fromOffset(80,80)
+	emoteBtn.BackgroundColor3=COLOR_BG_LIGHT; emoteBtn.BorderSizePixel=0
+	emoteBtn.Font=FONT_BODY_BLACK; emoteBtn.TextColor3=COLOR_TEXT
+	emoteBtn.Text=""; emoteBtn.Parent=emoteWheel; corner(emoteBtn,14)
+
+	-- emoji display (best effort)
+	local emojiL = Instance.new("TextLabel")
+	emojiL.Size=UDim2.new(1,0,0.55,0); emojiL.BackgroundTransparency=1
+	emojiL.Font=FONT_BODY_BLACK; emojiL.TextColor3=COLOR_SUCCESS
+	emojiL.TextScaled=true; emojiL.Text=EMOTE_GLYPH_DISPLAY[emoteData.id] or "?"
+	emojiL.Parent=emoteBtn
+
+	local nameL = Instance.new("TextLabel")
+	nameL.Position=UDim2.new(0,0,0.55,0); nameL.Size=UDim2.new(1,0,0.45,0)
+	nameL.BackgroundTransparency=1; nameL.Font=FONT_BODY; nameL.TextColor3=COLOR_TEXT_DIM
+	nameL.TextScaled=true; nameL.Text=emoteData.name; nameL.Parent=emoteBtn
+
+	emoteBtn.Activated:Connect(function()
+		emoteOverlay.Visible = false
+		if RequestEmote then RequestEmote:FireServer(emoteData.id) end
+	end)
+end
+
+-- Close emote wheel on click outside
+emoteOverlay.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		emoteOverlay.Visible = false
+	end
+end)
+
+local function toggleEmoteWheel()
+	emoteOverlay.Visible = not emoteOverlay.Visible
+end
+
+local function showEmoteBubble(player, emoteId)
+	local displayGlyph = EMOTE_GLYPH_DISPLAY[emoteId] or "?"
+	local character = player.Character
+	local head = character and character:FindFirstChild("Head")
+	if not head then return end
+
+	local bubbleGui = Instance.new("BillboardGui")
+	bubbleGui.Size=UDim2.fromOffset(60,60); bubbleGui.StudsOffset=Vector3.new(0,2.6,0)
+	bubbleGui.AlwaysOnTop=true; bubbleGui.Adornee=head; bubbleGui.Parent=head
+
+	local bubbleLabel = Instance.new("TextLabel")
+	bubbleLabel.Size=UDim2.fromScale(1,1); bubbleLabel.BackgroundColor3=COLOR_BG
+	bubbleLabel.BackgroundTransparency=0.15; bubbleLabel.Font=FONT_BODY_BLACK
+	bubbleLabel.TextScaled=true; bubbleLabel.Text=displayGlyph; bubbleLabel.Parent=bubbleGui
+	corner(bubbleLabel,30)
+
+	task.delay(2.2, function() if bubbleGui then bubbleGui:Destroy() end end)
+end
+
+if PlayEmote then PlayEmote.OnClientEvent:Connect(showEmoteBubble) end
+
+-- ──────────────────────────────────────────
+-- HELPERS
+-- ──────────────────────────────────────────
+local function isLocalTarget() return currentTarget == localPlayer end
+local function isHuntPhase()   return currentPhase == "Hunt" end
+
+local function updateRoleUI()
+	if isLocalTarget() then
+		roleLabel.Text="⚠ YOU ARE THE TARGET"; roleLabel.TextColor3=COLOR_DANGER
+		roleBadge.BackgroundColor3=Color3.fromRGB(50,22,26)
+	elseif currentTarget then
+		roleLabel.Text="► HUNTER"; roleLabel.TextColor3=COLOR_INFO
+		roleBadge.BackgroundColor3=COLOR_BG_LIGHT
+	else
+		roleLabel.Text="⏳ WAITING"; roleLabel.TextColor3=COLOR_TEXT_DIM
+		roleBadge.BackgroundColor3=COLOR_BG_LIGHT
+	end
+	targetAbilityButton.Visible = isHuntPhase() and isLocalTarget()
+	hunterBoostButton.Visible   = isHuntPhase() and currentTarget ~= nil and not isLocalTarget()
+end
+
+local function setPhaseColor(color)
+	timerStripFill.BackgroundColor3 = color
+end
+
+local function punchIn(label)
+	label.TextTransparency=1; announcementHolder.Size=UDim2.fromScale(0.7,0.09)
+	TweenService:Create(announcementHolder, TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out), { Size=UDim2.fromScale(0.92,0.12) }):Play()
+	TweenService:Create(label, TweenInfo.new(0.16), { TextTransparency=0 }):Play()
+end
+
+local function showAnnouncement(message, kind, duration)
+	announcementLabel.Text = message
+	if kind=="target-selected" then
+		announcementLabel.TextColor3=COLOR_DANGER; setPhaseColor(COLOR_DANGER)
+	elseif kind=="survived" then
+		announcementLabel.TextColor3=COLOR_GOLD; setPhaseColor(COLOR_GOLD)
+	elseif kind=="caught" then
+		announcementLabel.TextColor3=COLOR_DANGER
+	else
+		announcementLabel.TextColor3=COLOR_TEXT; setPhaseColor(COLOR_INFO)
+	end
+	punchIn(announcementLabel)
+	task.delay(duration or 3, function()
+		TweenService:Create(announcementLabel, TweenInfo.new(0.35), { TextTransparency=1 }):Play()
+	end)
+end
+
+local function showCoinPopup(amount)
+	coinPopup.Text="◉ +"..tostring(amount); coinPopup.Position=UDim2.fromScale(0.5,0.105)
+	coinPopup.BackgroundTransparency=0.05; coinPopup.TextTransparency=0; coinPopup.Size=UDim2.fromOffset(150,38)
+	TweenService:Create(coinPopup, TweenInfo.new(0.5,Enum.EasingStyle.Quad,Enum.EasingDirection.Out), {
+		Position=UDim2.fromScale(0.5,0.14), BackgroundTransparency=1, TextTransparency=1, Size=UDim2.fromOffset(170,38),
+	}):Play()
+end
+
+local TOAST_STYLE = {
+	coins  = { glyph="◉", color=COLOR_GOLD  },
+	level  = { glyph="★", color=COLOR_INFO  },
+	quest  = { glyph="✔", color=COLOR_SUCCESS },
+	xp     = { glyph="*", color=Color3.fromRGB(180,140,255) },
+	shop   = { glyph="$", color=COLOR_GOLD  },
+	info   = { glyph="i", color=COLOR_TEXT_DIM },
+}
+
+local function showToast(title, message, kind)
+	local style = TOAST_STYLE[kind] or TOAST_STYLE.info
+
+	local toast = Instance.new("Frame")
+	toast.Name="Toast"; toast.Size=UDim2.fromOffset(280,70)
+	toast.BackgroundColor3=COLOR_BG; toast.BackgroundTransparency=0.05
+	toast.BorderSizePixel=0; toast.Parent=toastArea; corner(toast,12); stroke(toast,Color3.fromRGB(0,0,0),1,0.6)
+
+	local yOffset=0
+	for _, child in ipairs(toastArea:GetChildren()) do
+		if child:IsA("Frame") and child~=toast then yOffset+=78 end
+	end
+	toast.Position=UDim2.fromOffset(310,yOffset)
+
+	local glyphBadge = Instance.new("TextLabel")
+	glyphBadge.Size=UDim2.fromOffset(44,44); glyphBadge.Position=UDim2.fromOffset(12,13)
+	glyphBadge.BackgroundColor3=style.color; glyphBadge.BackgroundTransparency=0.1
+	glyphBadge.Font=FONT_BODY_BLACK; glyphBadge.TextScaled=true; glyphBadge.Text=style.glyph; glyphBadge.Parent=toast
+	corner(glyphBadge,10)
+
+	local toastTitle = Instance.new("TextLabel")
+	toastTitle.Position=UDim2.fromOffset(66,11); toastTitle.Size=UDim2.fromOffset(196,24)
+	toastTitle.BackgroundTransparency=1; toastTitle.Font=FONT_BODY_BLACK; toastTitle.TextColor3=COLOR_TEXT
+	toastTitle.TextScaled=true; toastTitle.TextXAlignment=Enum.TextXAlignment.Left
+	toastTitle.Text=title; toastTitle.Parent=toast
+
+	local toastBody = Instance.new("TextLabel")
+	toastBody.Position=UDim2.fromOffset(66,38); toastBody.Size=UDim2.fromOffset(196,22)
+	toastBody.BackgroundTransparency=1; toastBody.Font=FONT_BODY; toastBody.TextColor3=COLOR_TEXT_DIM
+	toastBody.TextScaled=true; toastBody.TextXAlignment=Enum.TextXAlignment.Left
+	toastBody.Text=message; toastBody.Parent=toast
+
+	TweenService:Create(toast, TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out), {
+		Position=UDim2.fromOffset(0,yOffset) }):Play()
+
+	task.delay(3.2, function()
+		if not toast.Parent then return end
+		local tween = TweenService:Create(toast, TweenInfo.new(0.22), { Position=UDim2.fromOffset(310,yOffset), BackgroundTransparency=1 })
+		tween:Play(); tween.Completed:Wait(); toast:Destroy()
+	end)
+end
+
+local function updateQuestRow(countLabel, barFill, done, current, goal)
+	countLabel.Text = done and "DONE" or (tostring(math.min(current,goal)).."/"..(goal))
+	countLabel.TextColor3 = done and COLOR_SUCCESS or COLOR_TEXT_DIM
+	local ratio = goal>0 and math.clamp(current/goal,0,1) or 0
+	TweenService:Create(barFill, TweenInfo.new(0.25), { Size=UDim2.fromScale(ratio,1) }):Play()
+	barFill.BackgroundColor3 = done and COLOR_SUCCESS or COLOR_INFO
+end
+
+local function updateQuestPanel(payload)
+	updateQuestRow(collectCount, collectBar, payload.collectDone, payload.collect, payload.collectGoal)
+	updateQuestRow(catchCount,   catchBar,   payload.catchDone,  payload.catch,   payload.catchGoal)
+	updateQuestRow(surviveCount, surviveBar, payload.surviveDone, payload.survive, payload.surviveGoal)
+end
+
+local function showRoundResult(payload)
+	if payload.event~="caught" and payload.event~="survived" then return end
+	resultPanel.Visible=true; resultPanel.BackgroundTransparency=0.05; resultPanel.Size=UDim2.fromOffset(400,200)
+	TweenService:Create(resultPanel, TweenInfo.new(0.2,Enum.EasingStyle.Back,Enum.EasingDirection.Out), { Size=UDim2.fromOffset(440,200) }):Play()
+
+	if payload.event=="survived" then
+		resultTitle.Text="★ TARGET SURVIVED"; resultTitle.TextColor3=COLOR_GOLD; resultAccent.BackgroundColor3=COLOR_GOLD
+		resultBody.Text="Reward: ◉ +"..tostring(payload.rewardCoins or 0).." Coins  /  ★ +"..tostring(payload.rewardXP or 0).." XP\nBounty saved: ◉ "..tostring(payload.bounty or 0)
+	else
+		resultTitle.Text="⚔ TARGET CAUGHT"; resultTitle.TextColor3=COLOR_DANGER; resultAccent.BackgroundColor3=COLOR_DANGER
+		if payload.hunterName and payload.hunterName~="" then
+			resultBody.Text=payload.hunterName.." claimed the bounty.\nReward: ◉ +"..tostring(payload.rewardCoins or 0).." Coins  /  ★ +"..tostring(payload.rewardXP or 0).." XP"
+		else
+			resultBody.Text="The target was eliminated.\nNo hunter reward this time."
+		end
+	end
+
+	task.delay(4, function()
+		if not resultPanel.Visible then return end
+		local tween = TweenService:Create(resultPanel, TweenInfo.new(0.25), { BackgroundTransparency=1 })
+		tween:Play(); tween.Completed:Wait(); resultPanel.Visible=false; resultPanel.BackgroundTransparency=0.05
+	end)
+end
+
+local function doRedFlash()
+	flash.BackgroundTransparency=0.5
+	TweenService:Create(flash, TweenInfo.new(0.45), { BackgroundTransparency=1 }):Play()
+end
+
+local function shakeCamera(duration, strength)
+	local character = localPlayer.Character
+	local humanoid  = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
+	local startTime = os.clock()
+	local connection
+	connection = game:GetService("RunService").RenderStepped:Connect(function()
+		local elapsed = os.clock()-startTime
+		if elapsed >= duration then humanoid.CameraOffset=Vector3.zero; connection:Disconnect(); return end
+		local fade = 1-(elapsed/duration)
+		humanoid.CameraOffset = Vector3.new((math.random()-0.5)*strength*fade, (math.random()-0.5)*strength*fade, 0)
+	end)
+end
+
+-- ──────────────────────────────────────────
+-- KILL EFFECT
+-- ──────────────────────────────────────────
+local slowMoActive = false
+
+local CONFETTI_COLORS = { COLOR_GOLD, COLOR_DANGER, COLOR_SUCCESS, COLOR_INFO, Color3.fromRGB(255,255,255) }
+
+local function spawnConfetti()
+	local holder = Instance.new("Frame"); holder.Name="Confetti"
+	holder.Size=UDim2.fromScale(1,1); holder.BackgroundTransparency=1; holder.ZIndex=50; holder.Parent=gui
+	for _ = 1,36 do
+		local piece = Instance.new("Frame")
+		piece.Size=UDim2.fromOffset(math.random(6,12),math.random(10,18))
+		piece.AnchorPoint=Vector2.new(0.5,0.5)
+		piece.Position=UDim2.fromScale(0.5+(math.random()-0.5)*0.2, 0.34)
+		piece.BackgroundColor3=CONFETTI_COLORS[math.random(1,#CONFETTI_COLORS)]
+		piece.BorderSizePixel=0; piece.Rotation=math.random(0,360); piece.ZIndex=51; piece.Parent=holder
+		TweenService:Create(piece, TweenInfo.new(math.random(9,14)/10, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Position=UDim2.fromScale(piece.Position.X.Scale+(math.random()-0.5)*0.5, piece.Position.Y.Scale+math.random(35,60)/100),
+			Rotation=piece.Rotation+math.random(180,540), BackgroundTransparency=1,
+		}):Play()
+	end
+	task.delay(1.6, function() holder:Destroy() end)
+end
+
+local function doSlowMotion(duration)
+	if slowMoActive then return end; slowMoActive=true
+	local originalGravity = workspace.Gravity
+	local originalFov     = camera.FieldOfView
+	TweenService:Create(camera, TweenInfo.new(duration*0.25, Enum.EasingStyle.Sine), { FieldOfView=originalFov-12 }):Play()
+	workspace.Gravity = originalGravity*0.35
+	task.delay(duration, function()
+		TweenService:Create(camera, TweenInfo.new(0.3, Enum.EasingStyle.Sine), { FieldOfView=originalFov }):Play()
+		workspace.Gravity=originalGravity; slowMoActive=false
+	end)
+end
+
+local function playKillEffect()
+	doSlowMotion(0.5); spawnConfetti()
+	if killSound.SoundId~="" then killSound:Play() end
+end
+
+if KillEffectTrigger then KillEffectTrigger.OnClientEvent:Connect(playKillEffect) end
+
+-- ──────────────────────────────────────────
+-- TARGET VISUALS
+-- ──────────────────────────────────────────
+local function clearTargetVisuals(keepConn)
+	if not keepConn then targetHidden=false end
+	if highlight then highlight:Destroy(); highlight=nil end
+	if billboard then billboard:Destroy(); billboard=nil; billboardText=nil; billboardDistance=nil end
+	if targetCharacterConnection and not keepConn then targetCharacterConnection:Disconnect(); targetCharacterConnection=nil end
+	targetArrow.Visible=false
+end
+
+local function setTargetMarkersEnabled(enabled)
+	if highlight then highlight.Enabled=enabled end
+	if billboard then billboard.Enabled=enabled end
+	targetArrow.Visible = enabled and currentTarget~=nil and currentTarget~=localPlayer
+end
+
+local function createTargetVisuals(targetPlayer)
+	clearTargetVisuals(true)
+	if not targetPlayer or targetPlayer==localPlayer then return end
+	local character = targetPlayer.Character
+	local head = character and character:FindFirstChild("Head")
+	if not head then return end
+
+	highlight = Instance.new("Highlight"); highlight.Name="TargetHighlight"
+	highlight.Adornee=character; highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillColor=COLOR_DANGER; highlight.OutlineColor=COLOR_TEXT
+	highlight.FillTransparency=0.7; highlight.OutlineTransparency=0; highlight.Parent=character
+
+	billboard = Instance.new("BillboardGui"); billboard.Name="TargetBillboard"
+	billboard.Adornee=head; billboard.AlwaysOnTop=true
+	billboard.Size=UDim2.fromOffset(190,64); billboard.StudsOffset=Vector3.new(0,3.4,0); billboard.Parent=head
+
+	local billboardFrame = Instance.new("Frame"); billboardFrame.Size=UDim2.fromScale(1,1)
+	billboardFrame.BackgroundColor3=COLOR_DANGER_DEEP; billboardFrame.BackgroundTransparency=0.1
+	billboardFrame.BorderSizePixel=0; billboardFrame.Parent=billboard; corner(billboardFrame,10)
+	stroke(billboardFrame,COLOR_TEXT,1,0.5)
+
+	billboardText = Instance.new("TextLabel"); billboardText.Size=UDim2.new(1,0,0.55,0)
+	billboardText.BackgroundTransparency=1; billboardText.Font=FONT_BODY_BLACK
+	billboardText.TextColor3=COLOR_TEXT; billboardText.TextScaled=true; billboardText.TextStrokeTransparency=0.3
+	billboardText.Text="⚔ "..targetPlayer.Name; billboardText.Parent=billboardFrame
+
+	billboardDistance = Instance.new("TextLabel"); billboardDistance.Size=UDim2.new(1,0,0.45,0)
+	billboardDistance.Position=UDim2.new(0,0,0.55,0); billboardDistance.BackgroundTransparency=1
+	billboardDistance.Font=FONT_BODY; billboardDistance.TextColor3=Color3.fromRGB(255,210,210)
+	billboardDistance.TextScaled=true; billboardDistance.Text="..."; billboardDistance.Parent=billboardFrame
+
+	targetArrow.Visible=true
+	if targetHidden then setTargetMarkersEnabled(false) end
+end
+
+-- ──────────────────────────────────────────
+-- ABILITY COOLDOWN UI
+-- ──────────────────────────────────────────
+local function startCooldown(button, statusLabel, readySetter, secondsLeft)
+	readySetter(false); button.BackgroundColor3=Color3.fromRGB(40,42,50)
+	task.spawn(function()
+		for i = secondsLeft,1,-1 do
+			statusLabel.Text=tostring(i).."s cooldown"; task.wait(1)
+		end
+		readySetter(true); statusLabel.Text="Ready"; button.BackgroundColor3=COLOR_BG_LIGHT
+	end)
+end
+
+local function requestTargetAbility()
+	if not targetAbilityButton.Visible or not targetAbilityReady then return end
+	targetAbilityReady=false; targetAbilityStatus.Text="..."
+	RequestTargetAbility:FireServer()
+end
+
+local function requestHunterBoost()
+	if not hunterBoostButton.Visible or not hunterBoostReady then return end
+	hunterBoostReady=false; hunterBoostStatus.Text="..."
+	RequestHunterBoost:FireServer()
+end
+
+targetAbilityButton.Activated:Connect(requestTargetAbility)
+hunterBoostButton.Activated:Connect(requestHunterBoost)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Enum.KeyCode.Q then requestTargetAbility()
+	elseif input.KeyCode == Enum.KeyCode.E then requestHunterBoost()
+	elseif input.KeyCode == Enum.KeyCode.V then toggleEmoteWheel()
+	end
+end)
+
+-- ──────────────────────────────────────────
+-- REMOTE HANDLERS
+-- ──────────────────────────────────────────
+SetTarget.OnClientEvent:Connect(function(targetPlayer)
+	if targetCharacterConnection then targetCharacterConnection:Disconnect(); targetCharacterConnection=nil end
+	currentTarget=targetPlayer; targetHidden=false
+	targetAbilityReady=true; hunterBoostReady=true
+	targetAbilityStatus.Text="Ready"; hunterBoostStatus.Text="Ready"
+
+	if targetPlayer and targetPlayer~=localPlayer then
+		targetCharacterConnection = targetPlayer.CharacterAdded:Connect(function()
+			task.wait(0.25); createTargetVisuals(currentTarget)
+		end)
+	end
+	createTargetVisuals(targetPlayer); updateRoleUI()
+	if targetPlayer==localPlayer then showAnnouncement("⚠ YOU ARE THE TARGET!", "target-selected", 4) end
+end)
+
+ClearTarget.OnClientEvent:Connect(function()
+	currentTarget=nil; targetHidden=false; clearTargetVisuals(); updateRoleUI()
+end)
+
+RoundTimerUpdate.OnClientEvent:Connect(function(phase, secondsLeft)
+	currentPhase=phase; phaseLabel.Text=string.upper(phase); timerLabel.Text=tostring(secondsLeft).."s"
+	local totalForPhase = phase=="Target selected" and 5 or 30
+	local ratio = totalForPhase>0 and math.clamp(secondsLeft/totalForPhase,0,1) or 0
+	TweenService:Create(timerStripFill, TweenInfo.new(0.2), { Size=UDim2.fromScale(ratio,1) }):Play()
+	if phase=="Hunt" and secondsLeft<=10 then
+		timerLabel.TextColor3=COLOR_DANGER; setPhaseColor(COLOR_DANGER)
+	else
+		timerLabel.TextColor3=COLOR_TEXT
+	end
+	updateRoleUI()
+end)
+
+RoundAnnouncement.OnClientEvent:Connect(function(message, kind, duration)
+	showAnnouncement(message, kind, duration)
+	if kind=="target-selected" then
+		doRedFlash(); shakeCamera(0.55,1.2)
+		if alarmSound.SoundId~="" then alarmSound:Play() end
+	end
+end)
+
+TargetCaught.OnClientEvent:Connect(function(hunter, target)
+	if hunter and target then showAnnouncement("⚔ "..hunter.Name.." caught "..target.Name.."!", "caught", 3)
+	else showAnnouncement("⚔ The target was caught!", "caught", 3) end
+	playKillEffect()
+end)
+
+AbilityCooldownUpdate.OnClientEvent:Connect(function(secondsLeft, canUse)
+	if canUse or secondsLeft<=0 then
+		targetAbilityReady=true; targetAbilityStatus.Text="Ready"; targetAbilityButton.BackgroundColor3=COLOR_BG_LIGHT; return
+	end
+	startCooldown(targetAbilityButton, targetAbilityStatus, function(v) targetAbilityReady=v end, secondsLeft)
+end)
+
+HunterBoostUpdate.OnClientEvent:Connect(function(secondsLeft, canUse)
+	if canUse or secondsLeft<=0 then
+		hunterBoostReady=true; hunterBoostStatus.Text="Ready"; hunterBoostButton.BackgroundColor3=COLOR_BG_LIGHT; return
+	end
+	startCooldown(hunterBoostButton, hunterBoostStatus, function(v) hunterBoostReady=v end, secondsLeft)
+end)
+
+TargetAbilityEffect.OnClientEvent:Connect(function(targetPlayer, isHidden)
+	if targetPlayer~=currentTarget or targetPlayer==localPlayer then return end
+	targetHidden=isHidden; setTargetMarkersEnabled(not isHidden)
+end)
+
+CoinCollected.OnClientEvent:Connect(showCoinPopup)
+
+RoundStatsUpdate.OnClientEvent:Connect(function(payload)
+	if payload.event=="intermission" then currentTarget=nil; bountyLabel.Text="◉ 0" end
+	showRoundResult(payload); updateRoleUI()
+end)
+
+QuestUpdate.OnClientEvent:Connect(updateQuestPanel)
+
+ProgressToast.OnClientEvent:Connect(function(title, message, kind)
+	showToast(title, message, kind)
+end)
+
+BountyUpdate.OnClientEvent:Connect(function(amount)
+	bountyLabel.Text="◉ "..tostring(amount)
+	if amount>0 then
+		TweenService:Create(bountyLabel, TweenInfo.new(0.12), { TextColor3=Color3.fromRGB(255,244,168) }):Play()
+		task.delay(0.18, function()
+			TweenService:Create(bountyLabel, TweenInfo.new(0.2), { TextColor3=COLOR_GOLD }):Play()
+		end)
+	end
+end)
+
+-- ──────────────────────────────────────────
+-- PER-FRAME: arrow + distance
+-- ──────────────────────────────────────────
+RunService.RenderStepped:Connect(function()
+	if targetHidden or not currentTarget or currentTarget==localPlayer then targetArrow.Visible=false; return end
+	local targetChar = currentTarget.Character
+	local myChar     = localPlayer.Character
+	local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+	local myRoot     = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	if not targetRoot or not myRoot then targetArrow.Visible=false; return end
+
+	local distance = math.floor((targetRoot.Position-myRoot.Position).Magnitude)
+	if billboardDistance then billboardDistance.Text=distance.."m away" end
+
+	camera = workspace.CurrentCamera
+	local viewportPoint = camera:WorldToViewportPoint(targetRoot.Position)
+	local viewportWidth = camera.ViewportSize.X
+	local x = math.clamp(viewportPoint.X, 80, viewportWidth-80)
+	targetArrow.Position=UDim2.fromOffset(x-75, 92)
+	targetArrowText.Text=distance.."m"
+	targetArrow.Visible=true
+end)

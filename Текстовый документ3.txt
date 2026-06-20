@@ -1,0 +1,900 @@
+-- Target Hunt V6 - Lobby / Shop / Quests / Leaderboard UI (Client)
+-- CHANGES from V5:
+--   • PLAY/LOBBY button: compact, centered at bottom of screen, no giant background
+--   • Shop tab icons fixed (no more broken emoji)
+--   • Beautiful Leaderboard panel (top-right, auto-updates via LeaderboardUpdate remote)
+--   • Emote button removed from this script (HUD script handles the V-key hint)
+-- Place in StarterPlayer > StarterPlayerScripts
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local localPlayer = Players.LocalPlayer
+local playerGui   = localPlayer:WaitForChild("PlayerGui")
+
+-- ──────────────────────────────────────────
+-- DESIGN TOKENS
+-- ──────────────────────────────────────────
+local FONT_DISPLAY    = Enum.Font.FredokaOne
+local FONT_BODY       = Enum.Font.GothamBold
+local FONT_BODY_BLACK = Enum.Font.GothamBlack
+
+local COLOR_BG        = Color3.fromRGB(16, 18, 24)
+local COLOR_BG_LIGHT  = Color3.fromRGB(26, 29, 38)
+local COLOR_BG_CARD   = Color3.fromRGB(31, 35, 44)
+local COLOR_DANGER    = Color3.fromRGB(255, 59, 78)
+local COLOR_DANGER_DEEP = Color3.fromRGB(176, 16, 38)
+local COLOR_GOLD      = Color3.fromRGB(255, 200, 60)
+local COLOR_SUCCESS   = Color3.fromRGB(61, 220, 132)
+local COLOR_INFO      = Color3.fromRGB(120, 180, 255)
+local COLOR_TEXT      = Color3.fromRGB(255, 255, 255)
+local COLOR_TEXT_DIM  = Color3.fromRGB(180, 190, 205)
+local COLOR_PURPLE    = Color3.fromRGB(165, 70, 255)
+
+-- Leaderboard rank colors
+local RANK_COLORS = {
+	Color3.fromRGB(255, 200, 50),   -- 1st  gold
+	Color3.fromRGB(192, 192, 192),  -- 2nd  silver
+	Color3.fromRGB(184, 115, 51),   -- 3rd  bronze
+}
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, radius or 10); c.Parent = parent; return c
+end
+local function stroke(parent, color, thickness, transparency)
+	local s = Instance.new("UIStroke"); s.Color=color or Color3.new(0,0,0); s.Thickness=thickness or 1; s.Transparency=transparency or 0.5; s.Parent=parent; return s
+end
+local function gradient(parent, colorSeq, rotation)
+	local g = Instance.new("UIGradient"); g.Color=colorSeq; g.Rotation=rotation or 90; g.Parent=parent; return g
+end
+
+-- ──────────────────────────────────────────
+-- REMOTES
+-- ──────────────────────────────────────────
+local remotesFolder = ReplicatedStorage:WaitForChild("TargetHuntRemotes", 10)
+if not remotesFolder then warn("[TargetHunt] Missing TargetHuntRemotes."); return end
+
+local function waitRemote(name)
+	local r = remotesFolder:WaitForChild(name, 10)
+	if not r then warn("[TargetHunt] Missing remote:", name) end
+	return r
+end
+
+local RequestJoinMatch  = waitRemote("RequestJoinMatch")
+local RequestLeaveMatch = waitRemote("RequestLeaveMatch")
+local MatchStateUpdate  = waitRemote("MatchStateUpdate")
+local OpenShop          = waitRemote("OpenShop")
+local OpenQuests        = waitRemote("OpenQuests")
+local RequestShopData   = waitRemote("RequestShopData")
+local RequestPurchase   = waitRemote("RequestPurchase")
+local RequestEquipItem  = waitRemote("RequestEquipItem")
+local ShopUpdate        = waitRemote("ShopUpdate")
+local QuestUpdate       = waitRemote("QuestUpdate")
+local LeaderboardUpdate = waitRemote("LeaderboardUpdate")
+
+if not (RequestJoinMatch and RequestLeaveMatch and MatchStateUpdate and OpenShop and OpenQuests
+	and RequestShopData and RequestPurchase and RequestEquipItem and ShopUpdate and QuestUpdate) then return end
+
+-- ──────────────────────────────────────────
+-- STATE
+-- ──────────────────────────────────────────
+local isInMatch            = false
+local latestMatchPayload   = nil
+local selectedShopCategory = "Aura"
+local latestShopPayload    = nil
+local latestQuestPayload   = nil
+
+local SHOP_CATEGORIES = { "Aura", "Trail", "Kill Effect", "Emote" }
+-- Fixed icons: pure ASCII/unicode that Roblox renders correctly
+local CATEGORY_ICON = {
+	Aura            = "★",
+	Trail           = "~",
+	["Kill Effect"] = "⚔",
+	Emote           = "♪",
+}
+local CATEGORY_COLOR = {
+	Aura            = COLOR_DANGER,
+	Trail           = COLOR_INFO,
+	["Kill Effect"] = COLOR_GOLD,
+	Emote           = COLOR_SUCCESS,
+}
+
+-- ──────────────────────────────────────────
+-- ROOT GUI
+-- ──────────────────────────────────────────
+local gui = Instance.new("ScreenGui")
+gui.Name           = "TargetHuntLobbyShopGui"
+gui.ResetOnSpawn   = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent         = playerGui
+
+-- ──────────────────────────────────────────
+-- PLAY / LOBBY BUTTON  (centered, bottom center, compact)
+-- ──────────────────────────────────────────
+local playButtonFrame = Instance.new("Frame")
+playButtonFrame.Name          = "PlayButtonFrame"
+playButtonFrame.AnchorPoint   = Vector2.new(0.5, 1)
+playButtonFrame.Position      = UDim2.new(0.5, 0, 1, -28)
+playButtonFrame.Size          = UDim2.fromOffset(200, 52)
+playButtonFrame.BackgroundTransparency = 1
+playButtonFrame.Parent        = gui
+
+local playButton = Instance.new("TextButton")
+playButton.Name              = "PlayButton"
+playButton.Size              = UDim2.fromScale(1, 1)
+playButton.BackgroundColor3  = COLOR_DANGER
+playButton.BorderSizePixel   = 0
+playButton.AutoButtonColor   = true
+playButton.Text              = ""
+playButton.Parent            = playButtonFrame
+corner(playButton, 14)
+stroke(playButton, Color3.fromRGB(255, 120, 130), 2, 0.35)
+gradient(playButton, ColorSequence.new(COLOR_DANGER, COLOR_DANGER_DEEP), 90)
+
+-- Icon label (left side)
+local playIcon = Instance.new("TextLabel")
+playIcon.Name               = "Icon"
+playIcon.Size               = UDim2.fromOffset(36, 36)
+playIcon.Position           = UDim2.fromOffset(10, 8)
+playIcon.BackgroundTransparency = 1
+playIcon.Font               = FONT_BODY_BLACK
+playIcon.TextColor3         = COLOR_TEXT
+playIcon.TextScaled         = true
+playIcon.Text               = "▶"
+playIcon.Parent             = playButton
+
+-- Text label
+local playLabel = Instance.new("TextLabel")
+playLabel.Name              = "Label"
+playLabel.Position          = UDim2.fromOffset(48, 0)
+playLabel.Size              = UDim2.new(1, -58, 1, 0)
+playLabel.BackgroundTransparency = 1
+playLabel.Font              = FONT_DISPLAY
+playLabel.TextColor3        = COLOR_TEXT
+playLabel.TextScaled        = true
+playLabel.TextXAlignment    = Enum.TextXAlignment.Left
+playLabel.Text              = "PLAY"
+playLabel.Parent            = playButton
+
+-- ──────────────────────────────────────────
+-- LEADERBOARD PANEL (top right, always visible)
+-- ──────────────────────────────────────────
+local lbPanel = Instance.new("Frame")
+lbPanel.Name            = "LeaderboardPanel"
+lbPanel.AnchorPoint     = Vector2.new(1, 0)
+lbPanel.Position        = UDim2.new(1, -16, 0, 16)
+lbPanel.Size            = UDim2.fromOffset(260, 36)  -- starts small, grows with entries
+lbPanel.BackgroundColor3 = COLOR_BG
+lbPanel.BackgroundTransparency = 0.06
+lbPanel.BorderSizePixel = 0
+lbPanel.Parent          = gui
+corner(lbPanel, 14)
+stroke(lbPanel, Color3.fromRGB(0,0,0), 1, 0.55)
+
+-- Decorative top gradient stripe
+local lbTopStripe = Instance.new("Frame")
+lbTopStripe.Name          = "TopStripe"
+lbTopStripe.Size          = UDim2.new(1, 0, 0, 4)
+lbTopStripe.BackgroundColor3 = COLOR_GOLD
+lbTopStripe.BorderSizePixel = 0
+lbTopStripe.Parent        = lbPanel
+corner(lbTopStripe, 14)
+gradient(lbTopStripe, ColorSequence.new({
+	ColorSequenceKeypoint.new(0, COLOR_GOLD),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 240, 120)),
+	ColorSequenceKeypoint.new(1, COLOR_GOLD),
+}), 0)
+
+-- Header
+local lbHeader = Instance.new("Frame")
+lbHeader.Name = "Header"
+lbHeader.Position = UDim2.fromOffset(0, 4)
+lbHeader.Size = UDim2.new(1, 0, 0, 38)
+lbHeader.BackgroundTransparency = 1
+lbHeader.Parent = lbPanel
+
+local lbTrophy = Instance.new("TextLabel")
+lbTrophy.Size = UDim2.fromOffset(34, 34)
+lbTrophy.Position = UDim2.fromOffset(10, 2)
+lbTrophy.BackgroundColor3 = Color3.fromRGB(255, 200, 50)
+lbTrophy.BackgroundTransparency = 0.1
+lbTrophy.Font = FONT_BODY_BLACK
+lbTrophy.TextColor3 = Color3.fromRGB(60, 40, 0)
+lbTrophy.TextScaled = true
+lbTrophy.Text = "★"
+lbTrophy.ZIndex = 3
+lbTrophy.Parent = lbHeader
+corner(lbTrophy, 10)
+
+local lbTitle = Instance.new("TextLabel")
+lbTitle.Position = UDim2.fromOffset(50, 4)
+lbTitle.Size = UDim2.new(1, -70, 0, 28)
+lbTitle.BackgroundTransparency = 1
+lbTitle.Font = FONT_DISPLAY
+lbTitle.TextColor3 = COLOR_GOLD
+lbTitle.TextScaled = true
+lbTitle.TextXAlignment = Enum.TextXAlignment.Left
+lbTitle.Text = "LEADERBOARD"
+lbTitle.Parent = lbHeader
+
+local lbSubtitle = Instance.new("TextLabel")
+lbSubtitle.Position = UDim2.fromOffset(50, 24)
+lbSubtitle.Size = UDim2.new(1, -60, 0, 16)
+lbSubtitle.BackgroundTransparency = 1
+lbSubtitle.Font = FONT_BODY
+lbSubtitle.TextColor3 = COLOR_TEXT_DIM
+lbSubtitle.TextScaled = true
+lbSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+lbSubtitle.Text = "Target Wins  •  Coins"
+lbSubtitle.Parent = lbHeader
+
+-- Divider
+local lbDivider = Instance.new("Frame")
+lbDivider.Name = "Divider"
+lbDivider.Position = UDim2.fromOffset(10, 44)
+lbDivider.Size = UDim2.new(1, -20, 0, 1)
+lbDivider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+lbDivider.BackgroundTransparency = 0.85
+lbDivider.BorderSizePixel = 0
+lbDivider.Parent = lbPanel
+
+-- Scroll frame for entries
+local lbScroll = Instance.new("ScrollingFrame")
+lbScroll.Name                 = "EntryScroll"
+lbScroll.Position             = UDim2.fromOffset(0, 48)
+lbScroll.Size                 = UDim2.new(1, 0, 1, -52)
+lbScroll.BackgroundTransparency = 1
+lbScroll.BorderSizePixel      = 0
+lbScroll.ScrollBarThickness   = 3
+lbScroll.ScrollBarImageColor3 = COLOR_GOLD
+lbScroll.CanvasSize           = UDim2.fromOffset(0, 0)
+lbScroll.AutomaticCanvasSize  = Enum.AutomaticSize.Y
+lbScroll.Parent               = lbPanel
+
+local lbLayout = Instance.new("UIListLayout")
+lbLayout.Padding           = UDim.new(0, 3)
+lbLayout.SortOrder         = Enum.SortOrder.LayoutOrder
+lbLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+lbLayout.Parent            = lbScroll
+
+local lbPadding = Instance.new("UIPadding")
+lbPadding.PaddingLeft  = UDim.new(0, 6)
+lbPadding.PaddingRight = UDim.new(0, 6)
+lbPadding.PaddingTop   = UDim.new(0, 4)
+lbPadding.PaddingBottom = UDim.new(0, 6)
+lbPadding.Parent       = lbScroll
+
+-- Row builder
+local function clearLeaderboard()
+	for _, child in ipairs(lbScroll:GetChildren()) do
+		if child.Name == "LBEntry" then child:Destroy() end
+	end
+end
+
+local function buildLeaderboardEntry(rank, data)
+	local isLocal = data.name == localPlayer.Name
+
+	local row = Instance.new("Frame")
+	row.Name            = "LBEntry"
+	row.LayoutOrder     = rank
+	row.Size            = UDim2.new(1, 0, 0, 38)
+	row.BackgroundColor3 = isLocal and Color3.fromRGB(30, 40, 60) or COLOR_BG_CARD
+	row.BackgroundTransparency = isLocal and 0.0 or 0.2
+	row.BorderSizePixel = 0
+	row.Parent          = lbScroll
+	corner(row, 8)
+
+	if isLocal then
+		stroke(row, COLOR_INFO, 1.5, 0.2)
+	end
+
+	-- Rank badge
+	local rankBadge = Instance.new("Frame")
+	rankBadge.Size          = UDim2.fromOffset(28, 28)
+	rankBadge.Position      = UDim2.fromOffset(5, 5)
+	rankBadge.BackgroundColor3 = RANK_COLORS[rank] or COLOR_BG_LIGHT
+	rankBadge.BackgroundTransparency = rank <= 3 and 0.0 or 0.4
+	rankBadge.BorderSizePixel = 0
+	rankBadge.Parent        = row
+	corner(rankBadge, 7)
+
+	local rankLabel = Instance.new("TextLabel")
+	rankLabel.Size              = UDim2.fromScale(1, 1)
+	rankLabel.BackgroundTransparency = 1
+	rankLabel.Font              = FONT_BODY_BLACK
+	rankLabel.TextColor3        = rank <= 3 and Color3.fromRGB(30, 20, 0) or COLOR_TEXT_DIM
+	rankLabel.TextScaled        = true
+	rankLabel.Text              = rank <= 3 and ({"1","2","3"})[rank] or tostring(rank)
+	rankLabel.Parent            = rankBadge
+
+	-- Player name
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Position          = UDim2.fromOffset(38, 3)
+	nameLabel.Size              = UDim2.new(1, -130, 0, 18)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Font              = isLocal and FONT_BODY_BLACK or FONT_BODY
+	nameLabel.TextColor3        = isLocal and COLOR_INFO or COLOR_TEXT
+	nameLabel.TextScaled        = true
+	nameLabel.TextXAlignment    = Enum.TextXAlignment.Left
+	nameLabel.Text              = isLocal and (data.name .. " ◀") or data.name
+	nameLabel.Parent            = row
+
+	-- Level badge
+	local lvlBadge = Instance.new("TextLabel")
+	lvlBadge.Position          = UDim2.fromOffset(38, 22)
+	lvlBadge.Size              = UDim2.fromOffset(60, 13)
+	lvlBadge.BackgroundColor3  = COLOR_BG_LIGHT
+	lvlBadge.BackgroundTransparency = 0.3
+	lvlBadge.Font              = FONT_BODY
+	lvlBadge.TextColor3        = COLOR_TEXT_DIM
+	lvlBadge.TextScaled        = true
+	lvlBadge.TextXAlignment    = Enum.TextXAlignment.Left
+	lvlBadge.Text              = "LV " .. tostring(data.level)
+	lvlBadge.Parent            = row
+	corner(lvlBadge, 4)
+
+	-- Wins stat
+	local winsFrame = Instance.new("Frame")
+	winsFrame.AnchorPoint      = Vector2.new(1, 0.5)
+	winsFrame.Position         = UDim2.new(1, -5, 0.5, 0)
+	winsFrame.Size             = UDim2.fromOffset(88, 28)
+	winsFrame.BackgroundColor3 = COLOR_BG_LIGHT
+	winsFrame.BackgroundTransparency = 0.4
+	winsFrame.BorderSizePixel  = 0
+	winsFrame.Parent           = row
+	corner(winsFrame, 7)
+
+	local winsLabel = Instance.new("TextLabel")
+	winsLabel.Size             = UDim2.fromScale(1, 0.5)
+	winsLabel.BackgroundTransparency = 1
+	winsLabel.Font             = FONT_BODY_BLACK
+	winsLabel.TextColor3       = rank == 1 and COLOR_GOLD or COLOR_TEXT
+	winsLabel.TextScaled       = true
+	winsLabel.Text             = "★ " .. tostring(data.wins)
+	winsLabel.Parent           = winsFrame
+
+	local coinsLabel = Instance.new("TextLabel")
+	coinsLabel.Position        = UDim2.fromScale(0, 0.5)
+	coinsLabel.Size            = UDim2.fromScale(1, 0.5)
+	coinsLabel.BackgroundTransparency = 1
+	coinsLabel.Font            = FONT_BODY
+	coinsLabel.TextColor3      = COLOR_TEXT_DIM
+	coinsLabel.TextScaled      = true
+	coinsLabel.Text            = "◉ " .. tostring(data.coins)
+	coinsLabel.Parent          = winsFrame
+
+	return row
+end
+
+local function updateLeaderboard(data)
+	clearLeaderboard()
+
+	if not data or #data == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.Name = "LBEntry"
+		empty.Size = UDim2.new(1, 0, 0, 36)
+		empty.BackgroundTransparency = 1
+		empty.Font = FONT_BODY
+		empty.TextColor3 = COLOR_TEXT_DIM
+		empty.TextScaled = true
+		empty.Text = "No players yet"
+		empty.Parent = lbScroll
+		lbPanel.Size = UDim2.fromOffset(260, 96)
+		return
+	end
+
+	for i, entry in ipairs(data) do
+		buildLeaderboardEntry(i, entry)
+	end
+
+	-- Resize panel to fit entries (max 8 visible)
+	local entryCount = math.min(#data, 8)
+	local panelHeight = 52 + (entryCount * 41) + 10
+	TweenService:Create(lbPanel, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {
+		Size = UDim2.fromOffset(260, panelHeight),
+	}):Play()
+end
+
+-- ──────────────────────────────────────────
+-- OVERLAY + PANEL SHELL
+-- ──────────────────────────────────────────
+local overlay = Instance.new("Frame")
+overlay.Name                   = "Overlay"
+overlay.Size                   = UDim2.fromScale(1, 1)
+overlay.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+overlay.BackgroundTransparency = 1
+overlay.BorderSizePixel        = 0
+overlay.Visible                = false
+overlay.Parent                 = gui
+
+local function makePanel(name, titleText, glyph, glyphColor)
+	local panel = Instance.new("Frame")
+	panel.Name                = name
+	panel.AnchorPoint         = Vector2.new(0.5, 0.5)
+	panel.Position            = UDim2.fromScale(0.5, 0.5)
+	panel.Size                = UDim2.fromOffset(580, 460)
+	panel.BackgroundColor3    = COLOR_BG
+	panel.BackgroundTransparency = 0.02
+	panel.BorderSizePixel     = 0
+	panel.Visible             = false
+	panel.Parent              = overlay
+	corner(panel, 18)
+	stroke(panel, Color3.fromRGB(0,0,0), 1, 0.5)
+
+	local sizeLimit = Instance.new("UISizeConstraint")
+	sizeLimit.MaxSize = Vector2.new(640, 500); sizeLimit.MinSize = Vector2.new(320, 320)
+	sizeLimit.Parent  = panel
+
+	local headerBar = Instance.new("Frame")
+	headerBar.Name              = "HeaderBar"
+	headerBar.Size              = UDim2.new(1, 0, 0, 64)
+	headerBar.BackgroundTransparency = 1
+	headerBar.Parent            = panel
+
+	-- Accent stripe at top
+	local accentStripe = Instance.new("Frame")
+	accentStripe.Size           = UDim2.new(1, 0, 0, 4)
+	accentStripe.BackgroundColor3 = glyphColor or COLOR_GOLD
+	accentStripe.BorderSizePixel = 0
+	accentStripe.Parent         = panel
+	corner(accentStripe, 18)
+	gradient(accentStripe, ColorSequence.new({
+		ColorSequenceKeypoint.new(0, glyphColor or COLOR_GOLD),
+		ColorSequenceKeypoint.new(1, (glyphColor or COLOR_GOLD):lerp(Color3.new(0,0,0), 0.3)),
+	}), 0)
+
+	local glyphBadge = Instance.new("TextLabel")
+	glyphBadge.Size             = UDim2.fromOffset(40, 40)
+	glyphBadge.Position         = UDim2.fromOffset(20, 14)
+	glyphBadge.BackgroundColor3 = glyphColor or COLOR_GOLD
+	glyphBadge.BackgroundTransparency = 0.1
+	glyphBadge.Font             = FONT_BODY_BLACK
+	glyphBadge.TextColor3       = Color3.fromRGB(30, 20, 0)
+	glyphBadge.TextScaled       = true
+	glyphBadge.Text             = glyph or "★"
+	glyphBadge.Parent           = headerBar
+	corner(glyphBadge, 10)
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Name             = "Title"
+	titleLabel.Position         = UDim2.fromOffset(72, 14)
+	titleLabel.Size             = UDim2.new(1, -136, 0, 40)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Font             = FONT_DISPLAY
+	titleLabel.TextColor3       = COLOR_TEXT
+	titleLabel.TextScaled       = true
+	titleLabel.TextXAlignment   = Enum.TextXAlignment.Left
+	titleLabel.Text             = titleText
+	titleLabel.Parent           = headerBar
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Name              = "Close"
+	closeBtn.AnchorPoint       = Vector2.new(1, 0)
+	closeBtn.Position          = UDim2.new(1, -18, 0, 14)
+	closeBtn.Size              = UDim2.fromOffset(40, 40)
+	closeBtn.BackgroundColor3  = COLOR_BG_LIGHT
+	closeBtn.BorderSizePixel   = 0
+	closeBtn.Font              = FONT_BODY_BLACK
+	closeBtn.TextColor3        = COLOR_TEXT
+	closeBtn.TextScaled        = true
+	closeBtn.Text              = "✕"
+	closeBtn.Parent            = panel
+	corner(closeBtn, 10)
+
+	closeBtn.Activated:Connect(function()
+		TweenService:Create(overlay, TweenInfo.new(0.14), { BackgroundTransparency = 1 }):Play()
+		task.delay(0.14, function() overlay.Visible = false end)
+		panel.Visible = false
+	end)
+
+	return panel
+end
+
+local shopPanel   = makePanel("ShopPanel",   "COSMETIC SHOP", "★", COLOR_GOLD)
+local questsPanel = makePanel("QuestsPanel", "QUEST BOARD",   "✔", COLOR_SUCCESS)
+
+local function openPanel(panel)
+	for _, child in ipairs(overlay:GetChildren()) do
+		if child:IsA("Frame") then child.Visible = false end
+	end
+	overlay.Visible = true
+	overlay.BackgroundTransparency = 1
+	panel.Visible = true
+	panel.Size    = UDim2.fromOffset(540, 430)
+	TweenService:Create(overlay, TweenInfo.new(0.16), { BackgroundTransparency = 0.4 }):Play()
+	TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = UDim2.fromOffset(580, 460),
+	}):Play()
+end
+
+-- ──────────────────────────────────────────
+-- SHOP PANEL CONTENTS
+-- ──────────────────────────────────────────
+local coinsPill = Instance.new("Frame")
+coinsPill.Name             = "CoinsPill"
+coinsPill.Position         = UDim2.fromOffset(20, 70)
+coinsPill.Size             = UDim2.fromOffset(150, 36)
+coinsPill.BackgroundColor3 = COLOR_BG_LIGHT
+coinsPill.BorderSizePixel  = 0
+coinsPill.Parent           = shopPanel
+corner(coinsPill, 18)
+
+local coinsLabel = Instance.new("TextLabel")
+coinsLabel.Name            = "CoinsLabel"
+coinsLabel.Size            = UDim2.fromScale(1, 1)
+coinsLabel.BackgroundTransparency = 1
+coinsLabel.Font            = FONT_DISPLAY
+coinsLabel.TextColor3      = COLOR_GOLD
+coinsLabel.TextScaled      = true
+coinsLabel.Text            = "◉ 0"
+coinsLabel.Parent          = coinsPill
+
+local tabsScroll = Instance.new("ScrollingFrame")
+tabsScroll.Name                 = "Tabs"
+tabsScroll.Position             = UDim2.fromOffset(180, 70)
+tabsScroll.Size                 = UDim2.new(1, -200, 0, 36)
+tabsScroll.BackgroundTransparency = 1
+tabsScroll.BorderSizePixel      = 0
+tabsScroll.ScrollBarThickness   = 0
+tabsScroll.ScrollingDirection   = Enum.ScrollingDirection.X
+tabsScroll.CanvasSize           = UDim2.fromOffset(0, 0)
+tabsScroll.AutomaticCanvasSize  = Enum.AutomaticSize.X
+tabsScroll.Parent               = shopPanel
+
+local tabsLayout = Instance.new("UIListLayout")
+tabsLayout.FillDirection        = Enum.FillDirection.Horizontal
+tabsLayout.Padding              = UDim.new(0, 8)
+tabsLayout.SortOrder            = Enum.SortOrder.LayoutOrder
+tabsLayout.Parent               = tabsScroll
+
+local tabButtons = {}
+
+local function makeTab(category)
+	local color = CATEGORY_COLOR[category] or COLOR_TEXT_DIM
+	local icon  = CATEGORY_ICON[category]  or "•"
+
+	local btn = Instance.new("TextButton")
+	btn.Name              = category .. "Tab"
+	btn.Size              = UDim2.fromOffset(120, 36)
+	btn.BackgroundColor3  = COLOR_BG_LIGHT
+	btn.BorderSizePixel   = 0
+	btn.AutoButtonColor   = true
+	btn.Font              = FONT_BODY_BLACK
+	btn.TextColor3        = COLOR_TEXT
+	btn.TextScaled        = true
+	btn.Text              = icon .. "  " .. string.upper(category)
+	btn.Parent            = tabsScroll
+	corner(btn, 10)
+	tabButtons[category]  = { button=btn, color=color }
+	return btn
+end
+
+for _, cat in ipairs(SHOP_CATEGORIES) do makeTab(cat) end
+
+local shopList = Instance.new("ScrollingFrame")
+shopList.Name                = "ShopList"
+shopList.Position            = UDim2.fromOffset(20, 116)
+shopList.Size                = UDim2.new(1, -40, 1, -136)
+shopList.BackgroundTransparency = 1
+shopList.BorderSizePixel     = 0
+shopList.ScrollBarThickness  = 5
+shopList.ScrollBarImageColor3 = COLOR_TEXT_DIM
+shopList.CanvasSize          = UDim2.fromOffset(0, 0)
+shopList.Parent              = shopPanel
+
+local shopLayout = Instance.new("UIListLayout")
+shopLayout.Padding           = UDim.new(0, 10)
+shopLayout.SortOrder         = Enum.SortOrder.LayoutOrder
+shopLayout.Parent            = shopList
+
+shopLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	shopList.CanvasSize = UDim2.fromOffset(0, shopLayout.AbsoluteContentSize.Y + 12)
+end)
+
+-- ──────────────────────────────────────────
+-- QUEST PANEL CONTENTS
+-- ──────────────────────────────────────────
+local questRewardLabel = Instance.new("TextLabel")
+questRewardLabel.Name            = "RewardLabel"
+questRewardLabel.Position        = UDim2.fromOffset(20, 70)
+questRewardLabel.Size            = UDim2.new(1, -40, 0, 30)
+questRewardLabel.BackgroundTransparency = 1
+questRewardLabel.Font            = FONT_BODY
+questRewardLabel.TextColor3      = COLOR_GOLD
+questRewardLabel.TextScaled      = true
+questRewardLabel.TextXAlignment  = Enum.TextXAlignment.Left
+questRewardLabel.Text            = "Reward: coins and XP"
+questRewardLabel.Parent          = questsPanel
+
+local questList = Instance.new("Frame")
+questList.Name                   = "QuestList"
+questList.Position               = UDim2.fromOffset(20, 112)
+questList.Size                   = UDim2.new(1, -40, 1, -132)
+questList.BackgroundTransparency = 1
+questList.Parent                 = questsPanel
+
+local questLayout = Instance.new("UIListLayout")
+questLayout.Padding  = UDim.new(0, 12)
+questLayout.SortOrder = Enum.SortOrder.LayoutOrder
+questLayout.Parent   = questList
+
+-- ──────────────────────────────────────────
+-- SHOP RENDER
+-- ──────────────────────────────────────────
+local function setTabVisuals()
+	for category, data in pairs(tabButtons) do
+		if category == selectedShopCategory then
+			data.button.BackgroundColor3 = data.color
+			local eg = data.button:FindFirstChildOfClass("UIGradient")
+			if eg then eg:Destroy() end
+		else
+			data.button.BackgroundColor3 = COLOR_BG_LIGHT
+		end
+	end
+end
+
+local function clearRows(container, rowName)
+	for _, child in ipairs(container:GetChildren()) do
+		if child.Name == rowName then child:Destroy() end
+	end
+end
+
+local function buildItemRow(item)
+	local row = Instance.new("Frame")
+	row.Name             = "ItemRow"
+	row.Size             = UDim2.new(1, -6, 0, 86)
+	row.BackgroundColor3 = COLOR_BG_CARD
+	row.BorderSizePixel  = 0
+	row.Parent           = shopList
+	corner(row, 12)
+	stroke(row, Color3.fromRGB(0,0,0), 1, 0.7)
+
+	local swatch = Instance.new("Frame")
+	swatch.Position       = UDim2.fromOffset(13, 13)
+	swatch.Size           = UDim2.fromOffset(58, 58)
+	swatch.BackgroundColor3 = item.color or COLOR_TEXT
+	swatch.BorderSizePixel = 0
+	swatch.Parent         = row
+	corner(swatch, 12)
+	stroke(swatch, COLOR_TEXT, 1, 0.6)
+
+	if item.equipped then
+		local checkBadge = Instance.new("TextLabel")
+		checkBadge.AnchorPoint = Vector2.new(1,1)
+		checkBadge.Position    = UDim2.new(1, 4, 1, 4)
+		checkBadge.Size        = UDim2.fromOffset(22, 22)
+		checkBadge.BackgroundColor3 = COLOR_SUCCESS
+		checkBadge.Font        = FONT_BODY_BLACK
+		checkBadge.TextColor3  = COLOR_TEXT
+		checkBadge.TextScaled  = true
+		checkBadge.Text        = "✓"
+		checkBadge.Parent      = swatch
+		corner(checkBadge, 11)
+	end
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Position        = UDim2.fromOffset(84, 12)
+	nameLabel.Size            = UDim2.new(1, -240, 0, 26)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Font            = FONT_BODY_BLACK
+	nameLabel.TextColor3      = COLOR_TEXT
+	nameLabel.TextScaled      = true
+	nameLabel.TextXAlignment  = Enum.TextXAlignment.Left
+	nameLabel.Text            = item.name
+	nameLabel.Parent          = row
+
+	local descLabel = Instance.new("TextLabel")
+	descLabel.Position        = UDim2.fromOffset(84, 44)
+	descLabel.Size            = UDim2.new(1, -240, 0, 22)
+	descLabel.BackgroundTransparency = 1
+	descLabel.Font            = FONT_BODY
+	descLabel.TextColor3      = COLOR_TEXT_DIM
+	descLabel.TextScaled      = true
+	descLabel.TextXAlignment  = Enum.TextXAlignment.Left
+	descLabel.Text            = item.description
+	descLabel.Parent          = row
+
+	local actionBtn = Instance.new("TextButton")
+	actionBtn.AnchorPoint    = Vector2.new(1, 0.5)
+	actionBtn.Position       = UDim2.new(1, -14, 0.5, 0)
+	actionBtn.Size           = UDim2.fromOffset(130, 48)
+	actionBtn.BackgroundColor3 = COLOR_DANGER
+	actionBtn.BorderSizePixel = 0
+	actionBtn.Font           = FONT_BODY_BLACK
+	actionBtn.TextColor3     = COLOR_TEXT
+	actionBtn.TextScaled     = true
+	actionBtn.Parent         = row
+	corner(actionBtn, 10)
+
+	if item.equipped then
+		actionBtn.Text = "EQUIPPED"
+		actionBtn.BackgroundColor3 = Color3.fromRGB(40, 70, 50)
+		actionBtn.AutoButtonColor = false
+	elseif item.owned then
+		actionBtn.Text = "EQUIP"
+		actionBtn.BackgroundColor3 = COLOR_INFO
+		actionBtn.Activated:Connect(function() RequestEquipItem:FireServer(item.id) end)
+	else
+		actionBtn.Text = "◉ " .. tostring(item.cost)
+		actionBtn.Activated:Connect(function() RequestPurchase:FireServer(item.id) end)
+	end
+end
+
+local function updateShop()
+	setTabVisuals()
+	clearRows(shopList, "ItemRow")
+
+	if not latestShopPayload then coinsLabel.Text = "◉ ..."; return end
+	coinsLabel.Text = "◉ " .. tostring(latestShopPayload.coins or 0)
+
+	local anyItem = false
+	for _, item in ipairs(latestShopPayload.items or {}) do
+		if item.category == selectedShopCategory then
+			buildItemRow(item); anyItem = true
+		end
+	end
+
+	if not anyItem then
+		local el = Instance.new("TextLabel"); el.Name="ItemRow"
+		el.Size=UDim2.new(1,-6,0,60); el.BackgroundTransparency=1
+		el.Font=FONT_BODY; el.TextColor3=COLOR_TEXT_DIM; el.TextScaled=true
+		el.Text="Coming soon."; el.Parent=shopList
+	end
+end
+
+-- ──────────────────────────────────────────
+-- QUEST RENDER
+-- ──────────────────────────────────────────
+local QUEST_ICON = { collect="◉", catch="⚔", survive="♥" }
+
+local function updateQuests()
+	clearRows(questList, "QuestRow")
+	if not latestQuestPayload then questRewardLabel.Text = "Reward: ..."; return end
+
+	questRewardLabel.Text = "★ Each quest: +" .. tostring(latestQuestPayload.rewardCoins or 0)
+		.. " coins / +" .. tostring(latestQuestPayload.rewardXP or 0) .. " XP"
+
+	for _, quest in ipairs(latestQuestPayload.quests or {}) do
+		local row = Instance.new("Frame")
+		row.Name = "QuestRow"
+		row.Size = UDim2.new(1, 0, 0, 80)
+		row.BackgroundColor3 = quest.done and Color3.fromRGB(28,56,40) or COLOR_BG_CARD
+		row.BorderSizePixel = 0
+		row.Parent = questList
+		corner(row, 12)
+		stroke(row, Color3.fromRGB(0,0,0), 1, 0.7)
+
+		local glyphBadge = Instance.new("TextLabel")
+		glyphBadge.Position = UDim2.fromOffset(14, 14)
+		glyphBadge.Size     = UDim2.fromOffset(48, 48)
+		glyphBadge.BackgroundColor3 = quest.done and COLOR_SUCCESS or COLOR_BG_LIGHT
+		glyphBadge.Font     = FONT_BODY_BLACK
+		glyphBadge.TextColor3 = COLOR_TEXT
+		glyphBadge.TextScaled = true
+		glyphBadge.Text     = QUEST_ICON[quest.key] or "★"
+		glyphBadge.Parent   = row
+		corner(glyphBadge, 12)
+
+		local titleL = Instance.new("TextLabel")
+		titleL.Position = UDim2.fromOffset(74, 12)
+		titleL.Size     = UDim2.new(1, -200, 0, 26)
+		titleL.BackgroundTransparency = 1
+		titleL.Font     = FONT_BODY_BLACK
+		titleL.TextColor3 = COLOR_TEXT
+		titleL.TextScaled = true
+		titleL.TextXAlignment = Enum.TextXAlignment.Left
+		titleL.Text     = quest.title
+		titleL.Parent   = row
+
+		local bodyL = Instance.new("TextLabel")
+		bodyL.Position  = UDim2.fromOffset(74, 42)
+		bodyL.Size      = UDim2.new(1, -200, 0, 22)
+		bodyL.BackgroundTransparency = 1
+		bodyL.Font      = FONT_BODY
+		bodyL.TextColor3 = COLOR_TEXT_DIM
+		bodyL.TextScaled = true
+		bodyL.TextXAlignment = Enum.TextXAlignment.Left
+		bodyL.Text      = quest.body
+		bodyL.Parent    = row
+
+		local progressL = Instance.new("TextLabel")
+		progressL.AnchorPoint = Vector2.new(1, 0.5)
+		progressL.Position    = UDim2.new(1, -14, 0.5, 0)
+		progressL.Size        = UDim2.fromOffset(100, 44)
+		progressL.BackgroundColor3 = quest.done and COLOR_SUCCESS or COLOR_BG_LIGHT
+		progressL.BorderSizePixel = 0
+		progressL.Font        = FONT_BODY_BLACK
+		progressL.TextColor3  = COLOR_TEXT
+		progressL.TextScaled  = true
+		progressL.Text        = quest.done and "DONE" or
+			(tostring(math.min(quest.current or 0, quest.goal or 0)) .. "/" .. tostring(quest.goal or 0))
+		progressL.Parent      = row
+		corner(progressL, 10)
+	end
+end
+
+-- ──────────────────────────────────────────
+-- WIRING
+-- ──────────────────────────────────────────
+playButton.Activated:Connect(function()
+	if isInMatch then RequestLeaveMatch:FireServer()
+	else RequestJoinMatch:FireServer() end
+end)
+
+for category, data in pairs(tabButtons) do
+	data.button.Activated:Connect(function()
+		selectedShopCategory = category
+		updateShop()
+	end)
+end
+
+local function applyHuntHudVisibility(payload)
+	local huntGui = playerGui:FindFirstChild("TargetHuntGui")
+	if not huntGui then return end
+	local inMatch = payload and payload.inMatch == true
+	local topBar = huntGui:FindFirstChild("TopBar"); if topBar then topBar.Visible = inMatch end
+	local questPnl = huntGui:FindFirstChild("QuestPanel"); if questPnl then questPnl.Visible = inMatch end
+	if not inMatch then
+		for _, name in ipairs({"TargetArrow","TargetAbilityButton","HunterBoostButton","ResultPanel"}) do
+			local el = huntGui:FindFirstChild(name); if el then el.Visible = false end
+		end
+	end
+end
+
+MatchStateUpdate.OnClientEvent:Connect(function(payload)
+	latestMatchPayload = payload
+	isInMatch          = payload.inMatch == true
+
+	if isInMatch then
+		playLabel.Text             = "LOBBY"
+		playIcon.Text              = "⬅"
+		playButton.BackgroundColor3 = COLOR_BG_CARD
+		-- Remove gradient for lobby state
+		local eg = playButton:FindFirstChildOfClass("UIGradient"); if eg then eg:Destroy() end
+		stroke(playButton, COLOR_TEXT_DIM, 1.5, 0.4)
+	else
+		playLabel.Text             = "PLAY"
+		playIcon.Text              = "▶"
+		playButton.BackgroundColor3 = COLOR_DANGER
+		-- Re-add gradient
+		local eg = playButton:FindFirstChildOfClass("UIGradient")
+		if not eg then
+			gradient(playButton, ColorSequence.new(COLOR_DANGER, COLOR_DANGER_DEEP), 90)
+		end
+		local es = playButton:FindFirstChildOfClass("UIStroke")
+		if es then es.Color=Color3.fromRGB(255,120,130); es.Transparency=0.35 end
+	end
+
+	applyHuntHudVisibility(payload)
+end)
+
+OpenShop.OnClientEvent:Connect(function()
+	RequestShopData:FireServer(); openPanel(shopPanel); updateShop()
+end)
+
+OpenQuests.OnClientEvent:Connect(function()
+	openPanel(questsPanel); updateQuests()
+end)
+
+ShopUpdate.OnClientEvent:Connect(function(payload)
+	latestShopPayload = payload; updateShop()
+end)
+
+QuestUpdate.OnClientEvent:Connect(function(payload)
+	latestQuestPayload = payload; updateQuests()
+end)
+
+LeaderboardUpdate.OnClientEvent:Connect(function(data)
+	updateLeaderboard(data)
+end)
+
+RequestShopData:FireServer()
+
+task.spawn(function()
+	for _ = 1, 30 do
+		if latestMatchPayload then applyHuntHudVisibility(latestMatchPayload) end
+		task.wait(0.5)
+	end
+end)
